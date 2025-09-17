@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 import pandas as pd
 import numpy as np
@@ -12,6 +13,13 @@ import zipfile
 
 app = Flask(__name__)
 app.secret_key = "dev-secret"
+# Upload size limit via env MAX_UPLOAD_MB (default 100 MB)
+try:
+    MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+except ValueError:
+    MAX_UPLOAD_MB = 100
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
 
 ALLOWED_EXTENSIONS = {"csv"}
 
@@ -158,7 +166,7 @@ def build_plot(df: pd.DataFrame, time_col: str, title="CW Loop", y1_min=0, y1_ma
 
     figure_html = pio.to_html(fig, include_plotlyjs=True, full_html=False)
     trace_names = [t.name for t in fig.data]
-    checkbox_items = "\\n".join(
+    checkbox_items = "\n".join(
         f'<label style="margin-right:12px;"><input type="checkbox" class="series-toggle" data-trace="{{i}}" checked> {{name}}</label>'
         for i, name in enumerate(trace_names)
     )
@@ -276,3 +284,10 @@ def process():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    limit_mb = int(app.config.get("MAX_CONTENT_LENGTH", 0) / (1024*1024))
+    return (f"Upload too large. Limit is {limit_mb} MB. "
+            f"You can raise it by setting env var MAX_UPLOAD_MB on Render.", 413)
