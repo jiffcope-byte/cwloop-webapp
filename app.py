@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
-from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 import pandas as pd
 import numpy as np
@@ -10,18 +9,21 @@ from pathlib import Path
 import tempfile
 import os
 import zipfile
+import re
+from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = "dev-secret"
-# Upload size limit via env MAX_UPLOAD_MB (default 100 MB)
-try:
-    MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
-except ValueError:
-    MAX_UPLOAD_MB = 100
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
-
+# Directory to host generated files (served at /static/exports/...)
+EXPORTS_DIR = Path(app.static_folder) / "exports"
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"csv"}
+
+def slugify(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9\-\_]+", "-", s.strip())
+    s = re.sub(r"-+", "-", s).strip("-").lower()
+    return s or "viewer"
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -166,7 +168,7 @@ def build_plot(df: pd.DataFrame, time_col: str, title="CW Loop", y1_min=0, y1_ma
 
     figure_html = pio.to_html(fig, include_plotlyjs=True, full_html=False)
     trace_names = [t.name for t in fig.data]
-    checkbox_items = "\n".join(
+    checkbox_items = "\\n".join(
         f'<label style="margin-right:12px;"><input type="checkbox" class="series-toggle" data-trace="{{i}}" checked> {{name}}</label>'
         for i, name in enumerate(trace_names)
     )
@@ -230,7 +232,14 @@ def build_plot(df: pd.DataFrame, time_col: str, title="CW Loop", y1_min=0, y1_ma
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    # Build a simple list of recent hosted HTML viewers
+    exports = []
+    try:
+        for p in sorted(EXPORTS_DIR.glob("*.html"), key=lambda x: x.stat().st_mtime, reverse=True)[:20]:
+            exports.append(p.name)
+    except Exception:
+        pass
+    return render_template("index.html", exports_list=exports)
 
 @app.route("/process", methods=["POST"])
 def process():
@@ -274,6 +283,17 @@ def process():
         html = build_plot(merged_df, time_col=time_col, title=title, y1_min=y1_min, y1_max=y1_max, setpoint_name=setpoint_name)
         html_bytes = html.encode("utf-8")
 
+    # ---- EXPORTS SAVE (hosted on /static/exports) ----
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    slug = slugify(title)
+    hosted_html = EXPORTS_DIR / f"{slug}-{ts}.html"
+    hosted_csv  = EXPORTS_DIR / f"{slug}-{ts}.csv"
+    try:
+        hosted_html.write_bytes(html_bytes)
+        hosted_csv.write_bytes(csv_buf.getvalue())
+    except Exception as e:
+        pass
+
     out_zip = BytesIO()
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{title} - merged.csv", csv_buf.getvalue())
@@ -284,10 +304,3 @@ def process():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-@app.errorhandler(RequestEntityTooLarge)
-def handle_file_too_large(e):
-    limit_mb = int(app.config.get("MAX_CONTENT_LENGTH", 0) / (1024*1024))
-    return (f"Upload too large. Limit is {limit_mb} MB. "
-            f"You can raise it by setting env var MAX_UPLOAD_MB on Render.", 413)

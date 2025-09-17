@@ -49,6 +49,26 @@
 
       <button type="submit">Process</button>
     </form>
+
+      <h2 style="margin-top:28px;">Recent hosted viewers</h2>
+      {% if exports_list and exports_list|length > 0 %}
+        <ul>
+          {% for fname in exports_list %}
+            <li>
+              <a href="{{ url_for('static', filename='exports/' + fname) }}" target="_blank" rel="noopener">
+                {{ fname }}
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+        <p style="color:#6b7280;font-size:0.9rem;">
+          These files are saved under <code>/static/exports</code> and are publicly accessible.
+          Note: on free Render, files may be cleared on redeploys. For durable hosting, use a Static Site.
+        </p>
+      {% else %}
+        <p style="color:#6b7280;">No hosted viewers yet. Generate one to see it listed here.</p>
+      {% endif %}
+
   </div>
 </body>
 </html>
