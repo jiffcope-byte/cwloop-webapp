@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Trend Merge & Viewer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"/>
+</head>
+<body>
+  <div class="container">
+    <h1>Trend Merge & Viewer</h1>
+    <p>Upload your <strong>Original CSV</strong> and any number of <strong>Additional CSVs</strong>. We'll align by the original timestamps, merge values, and return a ZIP with a merged CSV and a standalone Plotly viewer.</p>
+    <form action="{{ url_for('process') }}" method="post" enctype="multipart/form-data" class="card">
+      <label>Original CSV</label>
+      <input type="file" name="original_csv" accept=".csv" required />
+
+      <label>Additional CSVs (you can select multiple)</label>
+      <input type="file" name="other_csvs" accept=".csv" multiple />
+
+      <div class="grid">
+        <div>
+          <label>Tolerance (seconds)</label>
+          <input type="number" name="tolerance" value="5" min="0" />
+        </div>
+        <div>
+          <label>Title</label>
+          <input type="text" name="title" value="CW Loop" />
+        </div>
+        <div>
+          <label>Y1 Min</label>
+          <input type="number" name="y1_min" value="0" step="0.1" />
+        </div>
+        <div>
+          <label>Y1 Max</label>
+          <input type="number" name="y1_max" value="100" step="0.1" />
+        </div>
+      </div>
+
+      <div class="grid">
+        <div>
+          <label>Setpoint Column (optional)</label>
+          <input type="text" name="setpoint_name" placeholder="e.g., Plant Pumps.Active CW Flow Setpoint" />
+        </div>
+        <div>
+          <label>Cutoff Datetime (optional)</label>
+          <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
+        </div>
+      </div>
+
+      <button type="submit">Process</button>
+    </form>
+  </div>
+</body>
+</html>
