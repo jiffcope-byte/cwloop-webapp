@@ -3,410 +3,483 @@ import io
 import re
 import json
 import base64
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
+from flask import Flask, render_template, request, send_file, jsonify
+
 import requests
 
-from flask import Flask, render_template, request, send_file
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-APP_TITLE = "Trend Merge & Viewer"
-
-# Where we save generated files (and what Render serves)
-STATIC_EXPORT_ROOT = Path("static") / "exports"
-
-# Option B: GitHub static push (fine-grained PAT)
-GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
-STATIC_REPO = os.getenv("STATIC_REPO", "").strip()            # e.g. jiffcope-byte/cwloop-webapp
-STATIC_BRANCH = os.getenv("STATIC_BRANCH", "main").strip()
-STATIC_PATH = os.getenv("STATIC_PATH", "static/exports").strip()  # path inside the repo
-STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").rstrip("/")  # e.g. https://cwloop-static.onrender.com
-STATIC_DATED_SUBFOLDERS = os.getenv("STATIC_DATED_SUBFOLDERS", "true").lower() in ("1", "true", "yes")
-
-# Friendly timestamp column candidates
-TIME_CANDIDATES = [
-    "Time Stamp", "Timestamp", "DateTime", "Datetime", "TimeStamp",
-    "Date", "Time", "Date/Time", "Date Time"
-]
-
+# -----------------------------------------------------------------------------
+# Config & paths
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-# =============================================================================
+APP_ROOT = Path(__file__).resolve().parent
+STATIC_EXPORT_ROOT = (APP_ROOT / "static" / "exports")
+STATIC_EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+
+# GitHub push settings (OPTIONAL, leave blank to disable pushing)
+GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
+STATIC_REPO = os.getenv("STATIC_REPO", "").strip()              # e.g. 'jiffcope-byte/cwloop-webapp'
+STATIC_BRANCH = os.getenv("STATIC_BRANCH", "main").strip()
+STATIC_PATH = os.getenv("STATIC_PATH", "static/exports").strip() # path inside the repo
+STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").strip()     # e.g. https://cwloop-static.onrender.com
+
+# -----------------------------------------------------------------------------
 # Helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
+def _slugify(text: str) -> str:
+    text = str(text)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    return re.sub(r"[-\s]+", "-", text)
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def _clean_header(name: str) -> str:
+    """Remove device prefix to the left of first dot, keep the rest."""
+    if "." in name:
+        return name.split(".", 1)[1].strip()
+    return name.strip()
 
-def _read_csv(file_storage) -> pd.DataFrame:
-    """Read CSV with tolerant encodings; strip column whitespace."""
-    file_storage.stream.seek(0)
-    for enc in ("utf-8-sig", "utf-8", "cp1252"):
-        try:
-            df = pd.read_csv(file_storage.stream, encoding=enc)
-            break
-        except Exception:
-            file_storage.stream.seek(0)
-            continue
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def _find_time_col(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if c.strip() in TIME_CANDIDATES:
-            return c
-    # fallback: first parsable column
+def _detect_timestamp_column(df: pd.DataFrame) -> Optional[str]:
+    cand = [c for c in df.columns if c.strip().lower() in {
+        "time stamp", "timestamp", "date time", "datetime", "time", "date", " time stamp"
+    }]
+    if cand:
+        return cand[0]
+    # fallback: first datetime-like column
     for c in df.columns:
         try:
-            pd.to_datetime(df[c])
+            _ = pd.to_datetime(df[c], errors="raise", infer_datetime_format=True)
             return c
         except Exception:
             pass
     return None
 
-def _as_time_index(df: pd.DataFrame, tcol: str) -> pd.DataFrame:
-    df = df.copy()
-    df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
-    df = df.dropna(subset=[tcol]).drop_duplicates(subset=[tcol])
-    df = df.sort_values(tcol).set_index(tcol)
+def _parse_csv(file_storage) -> pd.DataFrame:
+    df = pd.read_csv(file_storage)
+    # Drop likely sequence columns
+    seq_cols = [c for c in df.columns if c.strip().lower() in {"sequence", "seq", "index"}]
+    if seq_cols:
+        df = df.drop(columns=seq_cols, errors="ignore")
     return df
 
-def _drop_seq_cols(df: pd.DataFrame) -> pd.DataFrame:
-    patt = re.compile(r"^(seq(uence)?|index)$", re.I)
-    return df[[c for c in df.columns if not patt.match(c)]]
+def _align_to_global(original: pd.DataFrame,
+                     extras: List[pd.DataFrame],
+                     tolerance_s: int) -> pd.DataFrame:
+    """
+    Align all additional CSVs to the original's time stamps using merge_asof
+    (nearest within tolerance), then forward-fill gaps.
+    """
+    # Find original timestamp col
+    ts_col = _detect_timestamp_column(original)
+    if not ts_col:
+        raise ValueError("Could not detect a timestamp column in the original CSV.")
+    # Parse original timestamps
+    original = original.copy()
+    original[ts_col] = pd.to_datetime(original[ts_col], errors="coerce")
+    original = original.dropna(subset=[ts_col]).sort_values(ts_col)
+    # Drop duplicates on time, keep first
+    original = original.drop_duplicates(subset=[ts_col], keep="first").reset_index(drop=True)
 
-def _sanitize_filename(name: str) -> str:
-    name = re.sub(r"[^\w\-. ]+", "", name.strip())
-    name = re.sub(r"\s+", " ", name).strip()
-    return name or "CW-loop"
+    # Clean original headers (remove prefixes)
+    rename_map = {c: _clean_header(c) for c in original.columns}
+    original = original.rename(columns=rename_map)
+    ts_col_clean = rename_map[ts_col]
 
-def _today_folder_name() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    global_df = original[[ts_col_clean]].copy()
 
-def _strip_prefix(name: str) -> str:
-    """Label helper: return text after the LAST '.'; unchanged if none."""
-    return name.split(".")[-1].strip()
+    # Keep original (non-timestamp) series too
+    for c in original.columns:
+        if c != ts_col_clean:
+            global_df[c] = original[c]
 
-def _github_put_content(path_in_repo: str, content_bytes: bytes, message: str) -> bool:
-    """Create/Update file in GitHub repo via API (PUT /contents)."""
+    tol = pd.Timedelta(seconds=tolerance_s if tolerance_s is not None else 0)
+
+    # Merge each extra onto the global timestamps
+    for extra in extras:
+        df = extra.copy()
+        ts2 = _detect_timestamp_column(df)
+        if not ts2:
+            # no timestamp => skip
+            continue
+        df[ts2] = pd.to_datetime(df[ts2], errors="coerce")
+        df = df.dropna(subset=[ts2]).sort_values(ts2).drop_duplicates(subset=[ts2], keep="first")
+
+        # Clean headers
+        df = df.rename(columns={c: _clean_header(c) for c in df.columns})
+        ts2_clean = _clean_header(ts2)
+
+        # columns to bring (numeric and bool)
+        cols = [c for c in df.columns if c != ts2_clean]
+
+        # Merge_asof nearest within tolerance
+        merged = pd.merge_asof(global_df[[ts_col_clean]], df[[ts2_clean] + cols],
+                               left_on=ts_col_clean, right_on=ts2_clean,
+                               direction="nearest", tolerance=tol)
+
+        # Drop the right timestamp
+        merged = merged.drop(columns=[ts2_clean], errors="ignore")
+
+        # Forward fill (carry last known value)
+        merged = merged.ffill()
+
+        # Append new columns
+        for c in cols:
+            if c not in global_df.columns:
+                global_df[c] = merged[c]
+            else:
+                # if name collision, create a unique name
+                i = 2
+                base = c
+                while c in global_df.columns:
+                    c = f"{base} ({i})"
+                    i += 1
+                global_df[c] = merged[base]
+
+    # Final tidy
+    global_df = global_df.sort_values(ts_col_clean).reset_index(drop=True)
+    return global_df, ts_col_clean
+
+def _build_plot(df: pd.DataFrame,
+                time_col: str,
+                title: str,
+                y1_min: Optional[float],
+                y1_max: Optional[float],
+                setpoint_col: Optional[str]) -> go.Figure:
+    fig = go.Figure()
+    yaxis2_needed = False
+    setpoint_norm = setpoint_col.strip().lower() if setpoint_col else ""
+
+    for c in df.columns:
+        if c == time_col:
+            continue
+        on_y2 = (setpoint_norm and c.strip().lower() == setpoint_norm)
+        if on_y2:
+            yaxis2_needed = True
+        fig.add_trace(go.Scatter(
+            x=df[time_col],
+            y=df[c],
+            mode="lines",
+            name=c,
+            yaxis="y2" if on_y2 else "y1",
+            hovertemplate="%{y}<extra>%{fullData.name}</extra>"
+        ))
+
+    layout = dict(
+        title=title or "CW Loop",
+        hovermode="x unified",
+        xaxis=dict(title=time_col, type="date"),
+        yaxis=dict(title="Percent", rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=50, r=50, t=60, b=40)
+    )
+    if y1_min is not None or y1_max is not None:
+        rng = []
+        rng.append(y1_min if y1_min is not None else None)
+        rng.append(y1_max if y1_max is not None else None)
+        layout["yaxis"]["range"] = rng
+
+    if yaxis2_needed:
+        layout["yaxis2"] = dict(
+            title="Setpoint",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        )
+
+    fig.update_layout(**layout)
+    return fig
+
+def _write_html(fig: go.Figure, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Standalone HTML
+    html_str = fig.to_html(full_html=True, include_plotlyjs="cdn")
+    out_path.write_text(html_str, encoding="utf-8")
+
+def _write_csv(df: pd.DataFrame, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False, encoding="utf-8")
+
+# -----------------------------------------------------------------------------
+# Index pages (top-level and per-day)
+# -----------------------------------------------------------------------------
+def _write_date_index(day_dir: Path):
+    rel = day_dir.relative_to(STATIC_EXPORT_ROOT).as_posix()
+    items = []
+    for p in sorted(day_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in {".html", ".csv"}:
+            items.append((p.name, f"./{p.name}"))
+    html = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>Exports – {rel}</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;padding:24px;max-width:1200px;margin:auto}a{color:#3b82f6;text-decoration:none}a:hover{text-decoration:underline}ul{line-height:1.8}</style>",
+        "</head><body>",
+        f"<h1>Exports – {rel}</h1>",
+        "<p><a href='../index.html'>&larr; All dates</a></p>",
+        "<ul>",
+    ]
+    for name, href in items:
+        html.append(f"<li><a href='{href}'>{name}</a></li>")
+    html += ["</ul></body></html>"]
+    (day_dir / "index.html").write_text("\n".join(html), encoding="utf-8")
+
+def _write_top_index(root_dir: Path):
+    # list date folders
+    dates = []
+    for d in sorted(root_dir.iterdir()):
+        if d.is_dir():
+            dates.append(d.name)
+    html = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        "<title>Exports</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;padding:24px;max-width:1200px;margin:auto}a{color:#3b82f6;text-decoration:none}a:hover{text-decoration:underline}ul{line-height:1.8}</style>",
+        "</head><body>",
+        "<h1>Exports</h1>",
+        "<ul>"
+    ]
+    for d in dates:
+        html.append(f"<li><a href='./{d}/index.html'>{d}</a></li>")
+    html += ["</ul></body></html>"]
+    (root_dir / "index.html").write_text("\n".join(html), encoding="utf-8")
+
+# -----------------------------------------------------------------------------
+# GitHub push (create/update contents API)
+# -----------------------------------------------------------------------------
+def _github_put_content(repo_rel_path: str, content_bytes: bytes, commit_message: str) -> bool:
+    """
+    Create/update a file in GitHub repo using the Contents API.
+    """
     if not (GH_TOKEN and STATIC_REPO and STATIC_BRANCH):
         return False
 
-    api = f"https://api.github.com/repos/{STATIC_REPO}/contents/{path_in_repo}"
-
-    # Get existing sha (update vs create)
-    sha = None
-    try:
-        r = requests.get(api, headers={"Authorization": f"Bearer {GH_TOKEN}"}, timeout=20)
-        if r.status_code == 200:
-            sha = r.json().get("sha")
-    except Exception as e:
-        log(f"[GitHub] HEAD failed: {e}")
+    url = f"https://api.github.com/repos/{STATIC_REPO}/contents/{repo_rel_path}"
+    headers = {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+    # check existing
+    r = requests.get(url, headers=headers, params={"ref": STATIC_BRANCH}, timeout=30)
+    sha = r.json().get("sha") if r.status_code == 200 else None
 
     payload = {
-        "message": message,
+        "message": commit_message,
         "content": base64.b64encode(content_bytes).decode("utf-8"),
         "branch": STATIC_BRANCH,
     }
     if sha:
         payload["sha"] = sha
 
-    try:
-        r2 = requests.put(
-            api,
-            headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"},
-            data=json.dumps(payload),
-            timeout=30,
-        )
-        ok = r2.status_code in (200, 201)
-        if not ok:
-            log(f"[GitHub] PUT failed {r2.status_code}: {r2.text[:200]}")
-        return ok
-    except Exception as e:
-        log(f"[GitHub] PUT exception: {e}")
+    r = requests.put(url, headers=headers, data=json.dumps(payload), timeout=30)
+    return r.status_code in (200, 201)
+
+def _push_static_file(repo_rel_path: str, content: bytes, message: str) -> bool:
+    """Wrapper that respects GH env presence and pushes one file."""
+    if not (GH_TOKEN and STATIC_REPO and STATIC_BRANCH and repo_rel_path):
         return False
+    return _github_put_content(repo_rel_path, content, message)
 
-def _collect_recent_exports() -> list[dict]:
-    """
-    Scan static/exports for latest HTMLs and build a list with direct links:
-    - local (served by this app): /static/exports/...
-    - static site (if configured): STATIC_SITE_BASE/static/exports/...
-    - github (blob link)
-    - CSV partners (local/static)
-    """
-    exports: list[dict] = []
-    if not STATIC_EXPORT_ROOT.exists():
-        return exports
+def _push_indexes(day_folder: Optional[str]):
+    """Always try to push the top index and the daily index (if any)."""
+    if not (GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH):
+        return
 
-    for day_dir in sorted(STATIC_EXPORT_ROOT.glob("*"), reverse=True):
-        if not day_dir.is_dir():
-            continue
-        for html in sorted(day_dir.glob("*.html"), reverse=True):
-            base = html.stem
-            csv = html.with_suffix(".csv")
+    # push top index
+    top_index = (STATIC_EXPORT_ROOT / "index.html")
+    if top_index.exists():
+        _push_static_file(
+            f"{STATIC_PATH}/index.html",
+            top_index.read_bytes(),
+            "Update exports top index"
+        )
 
-            rel_path_html = html.as_posix()     # static/exports/...
-            rel_path_csv  = csv.as_posix()
+    # push date index
+    if day_folder:
+        date_index = (STATIC_EXPORT_ROOT / day_folder / "index.html")
+        if date_index.exists():
+            _push_static_file(
+                f"{STATIC_PATH}/{day_folder}/index.html",
+                date_index.read_bytes(),
+                f"Update exports index for {day_folder}"
+            )
 
-            rec = {
-                "title": base.replace("-", " ").title(),
-                "ts": datetime.fromtimestamp(html.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                "local": f"/{rel_path_html}",
-                "csv_local": f"/{rel_path_csv}" if csv.exists() else None,
-            }
-            if STATIC_SITE_BASE:
-                rec["static_url"] = f"{STATIC_SITE_BASE}/{rel_path_html}"
-                rec["csv_static"] = f"{STATIC_SITE_BASE}/{rel_path_csv}" if csv.exists() else None
-            if STATIC_REPO:
-                rec["github"] = f"https://github.com/{STATIC_REPO}/blob/{STATIC_BRANCH}/{rel_path_html}"
-
-            exports.append(rec)
-
-    return exports[:50]
-
-def _write_date_index(day_dir: Path):
-    """Create/overwrite index.html inside a date folder with links to its files."""
-    rel_root = STATIC_EXPORT_ROOT  # static/exports
-    rows = []
-    for html in sorted(day_dir.glob("*.html")):
-        csv = html.with_suffix(".csv")
-        name = html.stem
-        html_rel = html.relative_to(rel_root).as_posix()   # e.g. 2025-09-23/CW-Loop.html
-        csv_rel  = csv.relative_to(rel_root).as_posix() if csv.exists() else None
-        rows.append((name, html_rel, csv_rel))
-
-    lines = [
-        "<!doctype html><meta charset='utf-8'>",
-        f"<title>{day_dir.name} – Exports</title>",
-        "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#0e1013;color:#e7edf7}"
-        "a{color:#5eb0ff;text-decoration:none} table{border-collapse:collapse;width:100%}"
-        "th,td{border-bottom:1px solid #232a34;padding:10px;text-align:left} .muted{color:#7b8aa5}</style>",
-        f"<h1>Exports for {day_dir.name}</h1>",
-        "<p class='muted'>HTML viewers and CSVs saved by the web app.</p>",
-        "<table><thead><tr><th>Name</th><th>Viewer</th><th>CSV</th></tr></thead><tbody>"
-    ]
-    for name, html_rel, csv_rel in rows:
-        lines.append("<tr>")
-        lines.append(f"<td>{name}</td>")
-        lines.append(f"<td><a href='./{Path(html_rel).name}'>View</a></td>")
-        if csv_rel:
-            lines.append(f"<td><a href='./{Path(csv_rel).name}'>CSV</a></td>")
-        else:
-            lines.append("<td class='muted'>–</td>")
-        lines.append("</tr>")
-    lines += ["</tbody></table>", "<p><a href='../index.html'>Back to dates</a></p>"]
-
-    (day_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
-
-def _write_top_index(root_dir: Path):
-    """Create/overwrite static/exports/index.html listing date folders."""
-    dates = [d for d in root_dir.glob("*") if d.is_dir()]
-    dates.sort(reverse=True)
-    lines = [
-        "<!doctype html><meta charset='utf-8'>",
-        "<title>Exports – Dates</title>",
-        "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#0e1013;color:#e7edf7}"
-        "a{color:#5eb0ff;text-decoration:none} ul{line-height:1.8} .muted{color:#7b8aa5}</style>",
-        "<h1>Export Dates</h1>",
-        "<p class='muted'>Choose a date to browse its viewers and CSVs.</p>",
-        "<ul>"
-    ]
-    for d in dates:
-        count = len(list(d.glob("*.html")))
-        lines.append(f"<li><a href='./{d.name}/index.html'>{d.name}</a> "
-                     f"<span class='muted'>({count} viewers)</span></li>")
-    lines += ["</ul>"]
-
-    (root_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Routes
-# =============================================================================
-
+# -----------------------------------------------------------------------------
 @app.get("/")
-def index():
-    exports = _collect_recent_exports()
-    return render_template(
-        "index.html",
-        title=APP_TITLE,
-        exports_list=exports,
-        site_base=STATIC_SITE_BASE,
-    )
+def home():
+    """
+    Renders upload UI + shows recent exports (from disk) with direct 'View' links
+    (if STATIC_SITE_BASE is configured).
+    """
+    # Build a small list of recent folders (dates)
+    folders = []
+    for d in sorted(STATIC_EXPORT_ROOT.iterdir()):
+        if d.is_dir():
+            folders.append(d.name)
+
+    # Build a list of recent .html files for convenience
+    recent = []
+    for d in sorted(STATIC_EXPORT_ROOT.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.html")):
+            rel_date = d.name
+            if STATIC_SITE_BASE:
+                web = f"{STATIC_SITE_BASE.rstrip('/')}/{STATIC_PATH.strip('/')}/{rel_date}/{f.name}"
+            else:
+                web = None
+            recent.append({
+                "date": rel_date,
+                "name": f.name,
+                "local": f.relative_to(APP_ROOT).as_posix(),
+                "web": web
+            })
+        if len(recent) > 50:
+            break
+
+    return render_template("index.html",
+                           recent_exports=recent,
+                           static_site_base=STATIC_SITE_BASE,
+                           static_path=STATIC_PATH)
 
 @app.post("/process")
 def process():
     """
-    1) Read original + extra CSVs
-    2) Align to original timeline, forward-fill
-    3) Optional cutoff, y2 axis for setpoint column
-    4) Save HTML + merged CSV to static/exports/YYYY-MM-DD/
-    5) Write browsable index.html (top and per-date)
-    6) Optional GitHub push (html+csv) into STATIC_PATH
-    7) Return ZIP containing both files for download
+    Receive original CSV + multiple additional CSVs, align to original timestamps,
+    build Plotly, write CSV/HTML, ALWAYS push indexes to GitHub (if configured),
+    then optionally push HTML/CSV.
     """
-    original = request.files.get("original_csv")
-    extras   = request.files.getlist("extra_csvs")
-
-    if not original or not original.filename:
-        return "Original CSV is required", 400
-
-    title = request.form.get("title", "CW Loop").strip() or "CW Loop"
-    setpoint_col_req = request.form.get("setpoint_col", "").strip()
-    cutoff = request.form.get("cutoff", "").strip()
-
     try:
-        y1_min = float(request.form.get("y1_min", 0))
-        y1_max = float(request.form.get("y1_max", 100))
-    except Exception:
-        y1_min, y1_max = 0, 100
+        # Inputs
+        title = (request.form.get("title") or "CW Loop").strip()
+        tol_s = int(request.form.get("tolerance", "5").strip() or "5")
+        y1_min = request.form.get("y1_min", "").strip()
+        y1_max = request.form.get("y1_max", "").strip()
+        setpoint_col = (request.form.get("setpoint_col") or "").strip()
 
-    # --- Original CSV ---
-    orig_df = _read_csv(original)
-    tcol = _find_time_col(orig_df)
-    if not tcol:
-        return "Could not find a timestamp column in the Original CSV", 400
+        y1_min_val = float(y1_min) if y1_min != "" else None
+        y1_max_val = float(y1_max) if y1_max != "" else None
 
-    base = _as_time_index(orig_df, tcol)
-    base = _drop_seq_cols(base)
+        if "original_csv" not in request.files:
+            return jsonify({"error": "No original CSV provided."}), 400
 
-    # --- Join Extras ---
-    accepted = 0
-    for f in (extras or []):
-        if not f or not f.filename:
-            continue
-        df = _read_csv(f)
-        t2 = _find_time_col(df)
-        if not t2:
-            continue
-        df = _as_time_index(df, t2)
-        df = _drop_seq_cols(df)
-        # avoid column collisions: add (filename) suffix if duplicates
-        dup = [c for c in df.columns if c in base.columns]
-        if dup:
-            suffix = f" ({os.path.basename(f.filename)})"
-            df = df.rename(columns={c: f"{c}{suffix}" for c in dup})
-        base = base.join(df, how="left")
-        accepted += 1
+        original_file = request.files["original_csv"]
+        if not original_file or original_file.filename == "":
+            return jsonify({"error": "Empty original CSV."}), 400
 
-    # forward fill extras
-    base = base.ffill()
+        add_files = request.files.getlist("additional_csvs")
 
-    # optional cutoff
-    if cutoff:
-        try:
-            cutoff_dt = pd.to_datetime(cutoff)
-            base = base[base.index >= cutoff_dt]
-        except Exception:
-            pass
+        original_df = _parse_csv(original_file)
+        extras = []
+        for f in add_files:
+            if f and f.filename:
+                extras.append(_parse_csv(f))
 
-    # map stripped names -> real columns (for setpoint lookup)
-    stripped_to_real: dict[str, str] = {}
-    for c in base.columns:
-        s = _strip_prefix(c)
-        stripped_to_real.setdefault(s, c)
+        merged_df, time_col = _align_to_global(original_df, extras, tol_s)
 
-    setpoint_col = None
-    if setpoint_col_req:
-        if setpoint_col_req in base.columns:
-            setpoint_col = setpoint_col_req
-        elif setpoint_col_req in stripped_to_real:
-            setpoint_col = stripped_to_real[setpoint_col_req]
+        # Build figure
+        fig = _build_plot(merged_df, time_col, title, y1_min_val, y1_max_val, setpoint_col)
 
-    use_y2 = bool(setpoint_col)
+        # Output file names
+        today = datetime.now(timezone.utc).astimezone().date().isoformat()
+        day_dir = STATIC_EXPORT_ROOT / today
+        day_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Build Plotly Figure with stripped labels ---
-    fig = go.Figure()
-    for col in base.columns:
-        label = _strip_prefix(col)
-        if use_y2 and col == setpoint_col:
-            fig.add_trace(go.Scatter(
-                x=base.index, y=base[col], name=label, mode="lines", yaxis="y2"
-            ))
-        else:
-            fig.add_trace(go.Scatter(
-                x=base.index, y=base[col], name=label, mode="lines"
-            ))
+        title_slug = _slugify(title)
+        html_name = f"{title_slug}-trend-viewer.html"
+        csv_name = f"{title_slug}-merged.csv"
 
-    fig.update_layout(
-        title=title,
-        xaxis_title="Time Stamp",
-        yaxis=dict(title="Percent", range=[y1_min, y1_max]),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        template="plotly_white"
-    )
-    if use_y2:
-        fig.update_layout(yaxis2=dict(overlaying="y", side="right", title="Setpoint"))
+        html_path = day_dir / html_name
+        csv_path = day_dir / csv_name
 
-    html_bytes = fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
-    merged = base.reset_index().rename(columns={"index": "Time Stamp"})
-    csv_bytes = merged.to_csv(index=False).encode("utf-8-sig")
+        _write_html(fig, html_path)
+        _write_csv(merged_df, csv_path)
 
-    # --- Save to static/exports/YYYY-MM-DD ---
-    day_folder = _today_folder_name() if STATIC_DATED_SUBFOLDERS else ""
-    out_dir = STATIC_EXPORT_ROOT / day_folder if day_folder else STATIC_EXPORT_ROOT
-    out_dir.mkdir(parents=True, exist_ok=True)
+        # Update indexes locally
+        _write_date_index(day_dir)
+        _write_top_index(STATIC_EXPORT_ROOT)
 
-    base_name = _sanitize_filename(title).replace(" ", "-")
-    html_name = f"{base_name}.html"
-    csv_name  = f"{base_name}.csv"
+        # --- Always push both index pages (if GH is configured) ---
+        _push_indexes(today)
 
-    (out_dir / html_name).write_bytes(html_bytes)
-    (out_dir / csv_name).write_bytes(csv_bytes)
+        # --- Optional GitHub push of the generated viewer + csv ---
+        if GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH:
+            repo_base = f"{STATIC_PATH}/{today}"
+            msg = f"Publish {html_name} & {csv_name}"
 
-    rel_html = (out_dir / html_name).as_posix()  # static/exports/...
-    rel_csv  = (out_dir / csv_name).as_posix()
+            _push_static_file(f"{repo_base}/{html_name}", html_path.read_bytes(), msg)
+            _push_static_file(f"{repo_base}/{csv_name}",  csv_path.read_bytes(),  msg)
 
-    log(f"[process] extras uploaded: {len(extras)}; accepted with time: {accepted}")
-    log(f"[process] saved: {rel_html}, {rel_csv}")
+            # Push indexes again (ensures they exist even if files were new)
+            _push_indexes(today)
 
-    # --- Write browsable index pages ---
-    _write_date_index(out_dir)
+        # Prepare downloads
+        html_bytes = html_path.read_bytes()
+        csv_bytes = csv_path.read_bytes()
+
+        # Web URLs (if configured)
+        web_html = None
+        if STATIC_SITE_BASE:
+            web_html = f"{STATIC_SITE_BASE.rstrip('/')}/{STATIC_PATH.strip('/')}/{today}/{html_name}"
+
+        return jsonify({
+            "ok": True,
+            "title": title,
+            "time_col": time_col,
+            "today": today,
+            "files": {
+                "html_name": html_name,
+                "csv_name": csv_name
+            },
+            "download": {
+                "html": f"/download?path={html_path.relative_to(APP_ROOT).as_posix()}",
+                "csv":  f"/download?path={csv_path.relative_to(APP_ROOT).as_posix()}",
+            },
+            "web": {
+                "html": web_html,
+                "top_index": f"{STATIC_SITE_BASE.rstrip('/')}/{STATIC_PATH.strip('/')}/index.html" if STATIC_SITE_BASE else None,
+                "date_index": f"{STATIC_SITE_BASE.rstrip('/')}/{STATIC_PATH.strip('/')}/{today}/index.html" if STATIC_SITE_BASE else None
+            }
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/download")
+def download():
+    rel = request.args.get("path", "")
+    if not rel:
+        return "Missing path", 400
+    file_path = (APP_ROOT / rel).resolve()
+    if not file_path.exists() or APP_ROOT not in file_path.parents:
+        return "Not found", 404
+    return send_file(file_path, as_attachment=True)
+
+@app.post("/rebuild-indexes")
+def rebuild_indexes():
+    """
+    Regenerate both levels of indexes and push them to GitHub.
+    Useful if you want to sync the listing without making a new chart.
+    """
     _write_top_index(STATIC_EXPORT_ROOT)
+    for d in sorted(STATIC_EXPORT_ROOT.glob("*")):
+        if d.is_dir():
+            _write_date_index(d)
 
-    # --- Optional GitHub push (for static site / GitHub browsing) ---
-    if GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH:
-        repo_base = f"{STATIC_PATH}/{day_folder}" if day_folder else STATIC_PATH
-        repo_html = f"{repo_base}/{html_name}"
-        repo_csv  = f"{repo_base}/{csv_name}"
-        msg = f"Publish {html_name} & {csv_name}"
-        ok1 = _github_put_content(repo_html, html_bytes, msg)
-        ok2 = _github_put_content(repo_csv,  csv_bytes,  msg)
-        # also push updated indexes
-        # top index
-        top_index_bytes = (STATIC_EXPORT_ROOT / "index.html").read_bytes()
-        _github_put_content(f"{STATIC_PATH}/index.html", top_index_bytes, "Update exports index")
-        # date index
-        if day_folder:
-            date_index_bytes = (out_dir / "index.html").read_bytes()
-            _github_put_content(f"{repo_base}/index.html", date_index_bytes, f"Update {day_folder} index")
-        log(f"[GitHub] push html={ok1} csv={ok2} base={STATIC_PATH}")
+    # push all indexes if GH is set
+    _push_indexes(None)
+    for d in sorted(STATIC_EXPORT_ROOT.glob("*")):
+        if d.is_dir():
+            _push_indexes(d.name)
 
-    # --- Return ZIP (html+csv) for immediate download ---
-    import zipfile
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr(html_name, html_bytes)
-        z.writestr(csv_name,  csv_bytes)
-    mem.seek(0)
+    return {"status": "ok", "pushed": bool(GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH)}
 
-    return send_file(
-        mem,
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name=f"{base_name}.zip"
-    )
-
-# =============================================================================
-# Dev entry
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # local dev
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False)
