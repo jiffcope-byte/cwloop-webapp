@@ -170,6 +170,61 @@ def _collect_recent_exports() -> list[dict]:
 
     return exports[:50]
 
+def _write_date_index(day_dir: Path):
+    """Create/overwrite index.html inside a date folder with links to its files."""
+    rel_root = STATIC_EXPORT_ROOT  # static/exports
+    rows = []
+    for html in sorted(day_dir.glob("*.html")):
+        csv = html.with_suffix(".csv")
+        name = html.stem
+        html_rel = html.relative_to(rel_root).as_posix()   # e.g. 2025-09-23/CW-Loop.html
+        csv_rel  = csv.relative_to(rel_root).as_posix() if csv.exists() else None
+        rows.append((name, html_rel, csv_rel))
+
+    lines = [
+        "<!doctype html><meta charset='utf-8'>",
+        f"<title>{day_dir.name} – Exports</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#0e1013;color:#e7edf7}"
+        "a{color:#5eb0ff;text-decoration:none} table{border-collapse:collapse;width:100%}"
+        "th,td{border-bottom:1px solid #232a34;padding:10px;text-align:left} .muted{color:#7b8aa5}</style>",
+        f"<h1>Exports for {day_dir.name}</h1>",
+        "<p class='muted'>HTML viewers and CSVs saved by the web app.</p>",
+        "<table><thead><tr><th>Name</th><th>Viewer</th><th>CSV</th></tr></thead><tbody>"
+    ]
+    for name, html_rel, csv_rel in rows:
+        lines.append("<tr>")
+        lines.append(f"<td>{name}</td>")
+        lines.append(f"<td><a href='./{Path(html_rel).name}'>View</a></td>")
+        if csv_rel:
+            lines.append(f"<td><a href='./{Path(csv_rel).name}'>CSV</a></td>")
+        else:
+            lines.append("<td class='muted'>–</td>")
+        lines.append("</tr>")
+    lines += ["</tbody></table>", "<p><a href='../index.html'>Back to dates</a></p>"]
+
+    (day_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
+
+def _write_top_index(root_dir: Path):
+    """Create/overwrite static/exports/index.html listing date folders."""
+    dates = [d for d in root_dir.glob("*") if d.is_dir()]
+    dates.sort(reverse=True)
+    lines = [
+        "<!doctype html><meta charset='utf-8'>",
+        "<title>Exports – Dates</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;background:#0e1013;color:#e7edf7}"
+        "a{color:#5eb0ff;text-decoration:none} ul{line-height:1.8} .muted{color:#7b8aa5}</style>",
+        "<h1>Export Dates</h1>",
+        "<p class='muted'>Choose a date to browse its viewers and CSVs.</p>",
+        "<ul>"
+    ]
+    for d in dates:
+        count = len(list(d.glob("*.html")))
+        lines.append(f"<li><a href='./{d.name}/index.html'>{d.name}</a> "
+                     f"<span class='muted'>({count} viewers)</span></li>")
+    lines += ["</ul>"]
+
+    (root_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
+
 # =============================================================================
 # Routes
 # =============================================================================
@@ -191,8 +246,9 @@ def process():
     2) Align to original timeline, forward-fill
     3) Optional cutoff, y2 axis for setpoint column
     4) Save HTML + merged CSV to static/exports/YYYY-MM-DD/
-    5) Optional GitHub push (html+csv) into STATIC_PATH
-    6) Return ZIP containing both files for download
+    5) Write browsable index.html (top and per-date)
+    6) Optional GitHub push (html+csv) into STATIC_PATH
+    7) Return ZIP containing both files for download
     """
     original = request.files.get("original_csv")
     extras   = request.files.getlist("extra_csvs")
@@ -289,7 +345,6 @@ def process():
         fig.update_layout(yaxis2=dict(overlaying="y", side="right", title="Setpoint"))
 
     html_bytes = fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
-
     merged = base.reset_index().rename(columns={"index": "Time Stamp"})
     csv_bytes = merged.to_csv(index=False).encode("utf-8-sig")
 
@@ -311,15 +366,26 @@ def process():
     log(f"[process] extras uploaded: {len(extras)}; accepted with time: {accepted}")
     log(f"[process] saved: {rel_html}, {rel_csv}")
 
+    # --- Write browsable index pages ---
+    _write_date_index(out_dir)
+    _write_top_index(STATIC_EXPORT_ROOT)
+
     # --- Optional GitHub push (for static site / GitHub browsing) ---
-    pushed_ok = False
     if GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH:
-        repo_html = f"{STATIC_PATH}/{day_folder}/{html_name}" if day_folder else f"{STATIC_PATH}/{html_name}"
-        repo_csv  = f"{STATIC_PATH}/{day_folder}/{csv_name}"  if day_folder else f"{STATIC_PATH}/{csv_name}"
+        repo_base = f"{STATIC_PATH}/{day_folder}" if day_folder else STATIC_PATH
+        repo_html = f"{repo_base}/{html_name}"
+        repo_csv  = f"{repo_base}/{csv_name}"
         msg = f"Publish {html_name} & {csv_name}"
         ok1 = _github_put_content(repo_html, html_bytes, msg)
         ok2 = _github_put_content(repo_csv,  csv_bytes,  msg)
-        pushed_ok = ok1 and ok2
+        # also push updated indexes
+        # top index
+        top_index_bytes = (STATIC_EXPORT_ROOT / "index.html").read_bytes()
+        _github_put_content(f"{STATIC_PATH}/index.html", top_index_bytes, "Update exports index")
+        # date index
+        if day_folder:
+            date_index_bytes = (out_dir / "index.html").read_bytes()
+            _github_put_content(f"{repo_base}/index.html", date_index_bytes, f"Update {day_folder} index")
         log(f"[GitHub] push html={ok1} csv={ok2} base={STATIC_PATH}")
 
     # --- Return ZIP (html+csv) for immediate download ---
