@@ -1,8 +1,8 @@
 import os
 import io
 import re
-import base64
 import json
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,21 +12,21 @@ import requests
 
 from flask import Flask, render_template, request, send_file
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Configuration
+# =============================================================================
 
 APP_TITLE = "Trend Merge & Viewer"
 
-# Where we save generated files locally (and where your static site publishes from)
+# Where we save generated files (and what Render serves)
 STATIC_EXPORT_ROOT = Path("static") / "exports"
 
-# Option B: publish to GitHub (fine-grained PAT)
+# Option B: GitHub static push (fine-grained PAT)
 GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
-STATIC_REPO = os.getenv("STATIC_REPO", "").strip()          # e.g. jiffcope-byte/cwloop-webapp
+STATIC_REPO = os.getenv("STATIC_REPO", "").strip()            # e.g. jiffcope-byte/cwloop-webapp
 STATIC_BRANCH = os.getenv("STATIC_BRANCH", "main").strip()
-STATIC_PATH = os.getenv("STATIC_PATH", "static/exports").strip()
-STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").rstrip("/")
+STATIC_PATH = os.getenv("STATIC_PATH", "static/exports").strip()  # path inside the repo
+STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").rstrip("/")  # e.g. https://cwloop-static.onrender.com
 STATIC_DATED_SUBFOLDERS = os.getenv("STATIC_DATED_SUBFOLDERS", "true").lower() in ("1", "true", "yes")
 
 # Friendly timestamp column candidates
@@ -37,12 +37,11 @@ TIME_CANDIDATES = [
 
 app = Flask(__name__)
 
+# =============================================================================
+# Helpers
+# =============================================================================
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-
-def log(msg: str):
+def log(msg: str) -> None:
     print(msg, flush=True)
 
 def _read_csv(file_storage) -> pd.DataFrame:
@@ -62,7 +61,7 @@ def _find_time_col(df: pd.DataFrame) -> str | None:
     for c in df.columns:
         if c.strip() in TIME_CANDIDATES:
             return c
-    # fallback: first column that can parse to datetime
+    # fallback: first parsable column
     for c in df.columns:
         try:
             pd.to_datetime(df[c])
@@ -91,22 +90,24 @@ def _today_folder_name() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def _strip_prefix(name: str) -> str:
-    """Return text after the LAST '.'; if no dot, return name unchanged."""
+    """Label helper: return text after the LAST '.'; unchanged if none."""
     return name.split(".")[-1].strip()
 
 def _github_put_content(path_in_repo: str, content_bytes: bytes, message: str) -> bool:
     """Create/Update file in GitHub repo via API (PUT /contents)."""
     if not (GH_TOKEN and STATIC_REPO and STATIC_BRANCH):
         return False
+
     api = f"https://api.github.com/repos/{STATIC_REPO}/contents/{path_in_repo}"
+
+    # Get existing sha (update vs create)
     sha = None
-    # Get existing file sha (update vs create)
-    r = requests.get(api, headers={"Authorization": f"Bearer {GH_TOKEN}"})
-    if r.status_code == 200:
-        try:
+    try:
+        r = requests.get(api, headers={"Authorization": f"Bearer {GH_TOKEN}"}, timeout=20)
+        if r.status_code == 200:
             sha = r.json().get("sha")
-        except Exception:
-            sha = None
+    except Exception as e:
+        log(f"[GitHub] HEAD failed: {e}")
 
     payload = {
         "message": message,
@@ -116,19 +117,29 @@ def _github_put_content(path_in_repo: str, content_bytes: bytes, message: str) -
     if sha:
         payload["sha"] = sha
 
-    r2 = requests.put(
-        api,
-        headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"},
-        data=json.dumps(payload),
-        timeout=30,
-    )
-    ok = r2.status_code in (200, 201)
-    if not ok:
-        log(f"[GitHub] Failed {r2.status_code}: {r2.text[:200]}")
-    return ok
+    try:
+        r2 = requests.put(
+            api,
+            headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"},
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        ok = r2.status_code in (200, 201)
+        if not ok:
+            log(f"[GitHub] PUT failed {r2.status_code}: {r2.text[:200]}")
+        return ok
+    except Exception as e:
+        log(f"[GitHub] PUT exception: {e}")
+        return False
 
 def _collect_recent_exports() -> list[dict]:
-    """Scan static/exports for latest HTML/CSV pairs to render on homepage."""
+    """
+    Scan static/exports for latest HTMLs and build a list with direct links:
+    - local (served by this app): /static/exports/...
+    - static site (if configured): STATIC_SITE_BASE/static/exports/...
+    - github (blob link)
+    - CSV partners (local/static)
+    """
     exports: list[dict] = []
     if not STATIC_EXPORT_ROOT.exists():
         return exports
@@ -139,50 +150,52 @@ def _collect_recent_exports() -> list[dict]:
         for html in sorted(day_dir.glob("*.html"), reverse=True):
             base = html.stem
             csv = html.with_suffix(".csv")
-            item = {
+
+            rel_path_html = html.as_posix()     # static/exports/...
+            rel_path_csv  = csv.as_posix()
+
+            rec = {
                 "title": base.replace("-", " ").title(),
                 "ts": datetime.fromtimestamp(html.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                "local": f"/{html.as_posix()}",
-                "size": f"{html.stat().st_size//1024} KB",
+                "local": f"/{rel_path_html}",
+                "csv_local": f"/{rel_path_csv}" if csv.exists() else None,
             }
-            rel_path = html.as_posix()  # static/exports/...
             if STATIC_SITE_BASE:
-                item["static_url"] = f"{STATIC_SITE_BASE}/{rel_path}"
+                rec["static_url"] = f"{STATIC_SITE_BASE}/{rel_path_html}"
+                rec["csv_static"] = f"{STATIC_SITE_BASE}/{rel_path_csv}" if csv.exists() else None
             if STATIC_REPO:
-                item["github"] = f"https://github.com/{STATIC_REPO}/blob/{STATIC_BRANCH}/{rel_path}"
-            if csv.exists():
-                item["notes"] = "CSV available"
-            exports.append(item)
+                rec["github"] = f"https://github.com/{STATIC_REPO}/blob/{STATIC_BRANCH}/{rel_path_html}"
+
+            exports.append(rec)
+
     return exports[:50]
 
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Routes
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @app.get("/")
 def index():
     exports = _collect_recent_exports()
     return render_template(
         "index.html",
+        title=APP_TITLE,
         exports_list=exports,
         site_base=STATIC_SITE_BASE,
-        pushed={}
     )
-
 
 @app.post("/process")
 def process():
     """
     1) Read original + extra CSVs
     2) Align to original timeline, forward-fill
-    3) Optional cutoff, y2 for setpoint column
+    3) Optional cutoff, y2 axis for setpoint column
     4) Save HTML + merged CSV to static/exports/YYYY-MM-DD/
-    5) If env available, push both files to GitHub static repo
-    6) Return ZIP (html+csv)
+    5) Optional GitHub push (html+csv) into STATIC_PATH
+    6) Return ZIP containing both files for download
     """
     original = request.files.get("original_csv")
-    extras = request.files.getlist("extra_csvs")
+    extras   = request.files.getlist("extra_csvs")
 
     if not original or not original.filename:
         return "Original CSV is required", 400
@@ -197,7 +210,7 @@ def process():
     except Exception:
         y1_min, y1_max = 0, 100
 
-    # Read & prep original
+    # --- Original CSV ---
     orig_df = _read_csv(original)
     tcol = _find_time_col(orig_df)
     if not tcol:
@@ -206,7 +219,7 @@ def process():
     base = _as_time_index(orig_df, tcol)
     base = _drop_seq_cols(base)
 
-    # Join extras
+    # --- Join Extras ---
     accepted = 0
     for f in (extras or []):
         if not f or not f.filename:
@@ -228,7 +241,7 @@ def process():
     # forward fill extras
     base = base.ffill()
 
-    # apply cutoff
+    # optional cutoff
     if cutoff:
         try:
             cutoff_dt = pd.to_datetime(cutoff)
@@ -236,26 +249,22 @@ def process():
         except Exception:
             pass
 
-    # Map stripped-name -> real column (for setpoint matching typed without prefix)
+    # map stripped names -> real columns (for setpoint lookup)
     stripped_to_real: dict[str, str] = {}
     for c in base.columns:
         s = _strip_prefix(c)
-        # only map if unique; if collision, prefer exact name later
         stripped_to_real.setdefault(s, c)
 
-    # Determine which column to use for y2
     setpoint_col = None
     if setpoint_col_req:
-        # 1) exact column name
         if setpoint_col_req in base.columns:
             setpoint_col = setpoint_col_req
-        # 2) match stripped label
         elif setpoint_col_req in stripped_to_real:
             setpoint_col = stripped_to_real[setpoint_col_req]
 
     use_y2 = bool(setpoint_col)
 
-    # Build figure with stripped legend names
+    # --- Build Plotly Figure with stripped labels ---
     fig = go.Figure()
     for col in base.columns:
         label = _strip_prefix(col)
@@ -284,14 +293,14 @@ def process():
     merged = base.reset_index().rename(columns={"index": "Time Stamp"})
     csv_bytes = merged.to_csv(index=False).encode("utf-8-sig")
 
-    # Save locally under static/exports/YYYY-MM-DD/
+    # --- Save to static/exports/YYYY-MM-DD ---
     day_folder = _today_folder_name() if STATIC_DATED_SUBFOLDERS else ""
     out_dir = STATIC_EXPORT_ROOT / day_folder if day_folder else STATIC_EXPORT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = _sanitize_filename(title).replace(" ", "-")
     html_name = f"{base_name}.html"
-    csv_name = f"{base_name}.csv"
+    csv_name  = f"{base_name}.csv"
 
     (out_dir / html_name).write_bytes(html_bytes)
     (out_dir / csv_name).write_bytes(csv_bytes)
@@ -299,26 +308,26 @@ def process():
     rel_html = (out_dir / html_name).as_posix()  # static/exports/...
     rel_csv  = (out_dir / csv_name).as_posix()
 
-    log(f"[process] extra files uploaded: {len(extras)}; accepted with time columns: {accepted}")
+    log(f"[process] extras uploaded: {len(extras)}; accepted with time: {accepted}")
     log(f"[process] saved: {rel_html}, {rel_csv}")
 
-    # Optional: push to GitHub static repo
+    # --- Optional GitHub push (for static site / GitHub browsing) ---
     pushed_ok = False
     if GH_TOKEN and STATIC_REPO and STATIC_BRANCH and STATIC_PATH:
         repo_html = f"{STATIC_PATH}/{day_folder}/{html_name}" if day_folder else f"{STATIC_PATH}/{html_name}"
         repo_csv  = f"{STATIC_PATH}/{day_folder}/{csv_name}"  if day_folder else f"{STATIC_PATH}/{csv_name}"
         msg = f"Publish {html_name} & {csv_name}"
         ok1 = _github_put_content(repo_html, html_bytes, msg)
-        ok2 = _github_put_content(repo_csv, csv_bytes, msg)
+        ok2 = _github_put_content(repo_csv,  csv_bytes,  msg)
         pushed_ok = ok1 and ok2
-        log(f"[GitHub] push html={ok1} csv={ok2} path base={STATIC_PATH}")
+        log(f"[GitHub] push html={ok1} csv={ok2} base={STATIC_PATH}")
 
-    # Return a small ZIP so user gets both files at once
+    # --- Return ZIP (html+csv) for immediate download ---
     import zipfile
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr(html_name, html_bytes)
-        z.writestr(csv_name, csv_bytes)
+        z.writestr(csv_name,  csv_bytes)
     mem.seek(0)
 
     return send_file(
@@ -328,11 +337,10 @@ def process():
         download_name=f"{base_name}.zip"
     )
 
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Dev entry
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 if __name__ == "__main__":
-    # for local testing
+    # local dev
     app.run(host="0.0.0.0", port=5000, debug=True)
