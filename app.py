@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from flask import Flask, render_template, request, send_file, url_for
+from flask import Flask, render_template, request, send_file
 
 # -----------------------------------------------------------------------------
 # Config
@@ -18,11 +18,10 @@ from flask import Flask, render_template, request, send_file, url_for
 
 APP_TITLE = "Trend Merge & Viewer"
 
-# Files saved under here; your static site publishes from the same path
-# e.g. Render Static Site "Publish Directory" = static/exports
+# Where we save generated files locally (and where your static site publishes from)
 STATIC_EXPORT_ROOT = Path("static") / "exports"
 
-# Env for Option B (GitHub publish)
+# Option B: publish to GitHub (fine-grained PAT)
 GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
 STATIC_REPO = os.getenv("STATIC_REPO", "").strip()          # e.g. jiffcope-byte/cwloop-webapp
 STATIC_BRANCH = os.getenv("STATIC_BRANCH", "main").strip()
@@ -30,7 +29,7 @@ STATIC_PATH = os.getenv("STATIC_PATH", "static/exports").strip()
 STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").rstrip("/")
 STATIC_DATED_SUBFOLDERS = os.getenv("STATIC_DATED_SUBFOLDERS", "true").lower() in ("1", "true", "yes")
 
-# Jinja expects these lists/keys
+# Friendly timestamp column candidates
 TIME_CANDIDATES = [
     "Time Stamp", "Timestamp", "DateTime", "Datetime", "TimeStamp",
     "Date", "Time", "Date/Time", "Date Time"
@@ -91,13 +90,17 @@ def _sanitize_filename(name: str) -> str:
 def _today_folder_name() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+def _strip_prefix(name: str) -> str:
+    """Return text after the LAST '.'; if no dot, return name unchanged."""
+    return name.split(".")[-1].strip()
+
 def _github_put_content(path_in_repo: str, content_bytes: bytes, message: str) -> bool:
     """Create/Update file in GitHub repo via API (PUT /contents)."""
     if not (GH_TOKEN and STATIC_REPO and STATIC_BRANCH):
         return False
     api = f"https://api.github.com/repos/{STATIC_REPO}/contents/{path_in_repo}"
     sha = None
-    # Try to get existing file sha (so we "update" instead of "create")
+    # Get existing file sha (update vs create)
     r = requests.get(api, headers={"Authorization": f"Bearer {GH_TOKEN}"})
     if r.status_code == 200:
         try:
@@ -142,16 +145,11 @@ def _collect_recent_exports() -> list[dict]:
                 "local": f"/{html.as_posix()}",
                 "size": f"{html.stat().st_size//1024} KB",
             }
-            # If static site base is configured, add fully qualified static URL
             rel_path = html.as_posix()  # static/exports/...
             if STATIC_SITE_BASE:
                 item["static_url"] = f"{STATIC_SITE_BASE}/{rel_path}"
-
-            # GitHub link (to the raw file path in repo)
             if STATIC_REPO:
                 item["github"] = f"https://github.com/{STATIC_REPO}/blob/{STATIC_BRANCH}/{rel_path}"
-
-            # CSV link (local + static)
             if csv.exists():
                 item["notes"] = "CSV available"
             exports.append(item)
@@ -181,7 +179,7 @@ def process():
     3) Optional cutoff, y2 for setpoint column
     4) Save HTML + merged CSV to static/exports/YYYY-MM-DD/
     5) If env available, push both files to GitHub static repo
-    6) Return ZIP download OR HTML (here we return a ZIP)
+    6) Return ZIP (html+csv)
     """
     original = request.files.get("original_csv")
     extras = request.files.getlist("extra_csvs")
@@ -190,7 +188,7 @@ def process():
         return "Original CSV is required", 400
 
     title = request.form.get("title", "CW Loop").strip() or "CW Loop"
-    setpoint_col = request.form.get("setpoint_col", "").strip()
+    setpoint_col_req = request.form.get("setpoint_col", "").strip()
     cutoff = request.form.get("cutoff", "").strip()
 
     try:
@@ -238,18 +236,36 @@ def process():
         except Exception:
             pass
 
-    # Build figure
-    fig = go.Figure()
-    use_y2 = setpoint_col and setpoint_col in base.columns
+    # Map stripped-name -> real column (for setpoint matching typed without prefix)
+    stripped_to_real: dict[str, str] = {}
+    for c in base.columns:
+        s = _strip_prefix(c)
+        # only map if unique; if collision, prefer exact name later
+        stripped_to_real.setdefault(s, c)
 
+    # Determine which column to use for y2
+    setpoint_col = None
+    if setpoint_col_req:
+        # 1) exact column name
+        if setpoint_col_req in base.columns:
+            setpoint_col = setpoint_col_req
+        # 2) match stripped label
+        elif setpoint_col_req in stripped_to_real:
+            setpoint_col = stripped_to_real[setpoint_col_req]
+
+    use_y2 = bool(setpoint_col)
+
+    # Build figure with stripped legend names
+    fig = go.Figure()
     for col in base.columns:
+        label = _strip_prefix(col)
         if use_y2 and col == setpoint_col:
             fig.add_trace(go.Scatter(
-                x=base.index, y=base[col], name=col, mode="lines", yaxis="y2"
+                x=base.index, y=base[col], name=label, mode="lines", yaxis="y2"
             ))
         else:
             fig.add_trace(go.Scatter(
-                x=base.index, y=base[col], name=col, mode="lines"
+                x=base.index, y=base[col], name=label, mode="lines"
             ))
 
     fig.update_layout(
@@ -297,8 +313,7 @@ def process():
         pushed_ok = ok1 and ok2
         log(f"[GitHub] push html={ok1} csv={ok2} path base={STATIC_PATH}")
 
-    # Option: return a small ZIP so user gets both files at once
-    # If you prefer to return just the HTML, replace the block below with send_file of html_bytes.
+    # Return a small ZIP so user gets both files at once
     import zipfile
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -319,5 +334,5 @@ def process():
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # for local testing only
+    # for local testing
     app.run(host="0.0.0.0", port=5000, debug=True)
