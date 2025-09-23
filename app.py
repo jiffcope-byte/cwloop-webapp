@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
 from werkzeug.utils import secure_filename
 import pandas as pd
@@ -6,17 +7,31 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timezone
 import tempfile
 import os
 import zipfile
 import re
-from datetime import datetime
+import base64
+import requests
+import json
+
+# Optional Google Drive (service account)
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaInMemoryUpload
+    from google.oauth2 import service_account
+    GDRIVE_AVAILABLE = True
+except Exception:
+    GDRIVE_AVAILABLE = False
 
 app = Flask(__name__)
 app.secret_key = "dev-secret"
-# Directory to host generated files (served at /static/exports/...)
+
+# ---- Static exports directory (still saved locally & served by Flask) ----
 EXPORTS_DIR = Path(app.static_folder) / "exports"
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+LATEST_JSON = EXPORTS_DIR / "latest.json"
 
 ALLOWED_EXTENSIONS = {"csv"}
 
@@ -79,6 +94,7 @@ def merge_align(original_csv_path: Path, other_csv_paths, tolerance_seconds=5, c
         df[tcol] = tparsed
         df = df[df[tcol].notna()].sort_values(tcol)
 
+        # pick numeric columns
         value_cols = []
         for c in df.columns:
             if c == tcol: continue
@@ -152,94 +168,92 @@ def build_plot(df: pd.DataFrame, time_col: str, title="CW Loop", y1_min=0, y1_ma
             mode="lines",
             name=col,
             yaxis="y2" if use_y2 else "y",
-            hovertemplate=f"{col}: %{{y}}<br>%{{x}}<extra></extra>"
+            hovertemplate=f"{col}: %{{y:.2f}}<extra></extra>"
         ))
 
     fig.update_layout(
         title=title,
-        xaxis=dict(title=time_col, rangeslider=dict(visible=True), type="date"),
+        xaxis=dict(title=time_col, rangeslider=dict(visible=True), type="date", showspikes=True, spikemode='across', spikesnap='cursor'),
         yaxis=dict(title="Percent", range=[y1_min, y1_max]),
         yaxis2=dict(title=setpoint_name if setpoint_name else "Setpoint", overlaying="y", side="right", showgrid=False, autorange=True),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=60, r=80, t=60, b=40),
         hovermode="x unified",
+        hoverdistance=30,
         height=800
     )
+    return pio.to_html(fig, include_plotlyjs=True, full_html=True)
 
-    figure_html = pio.to_html(fig, include_plotlyjs=True, full_html=False)
-    trace_names = [t.name for t in fig.data]
-    checkbox_items = "\\n".join(
-        f'<label style="margin-right:12px;"><input type="checkbox" class="series-toggle" data-trace="{{i}}" checked> {{name}}</label>'
-        for i, name in enumerate(trace_names)
-    )
+# ---- GitHub upload (Option B with dated subfolders) ----
+def push_to_github(repo: str, branch: str, path: str, content_bytes: bytes, message: str):
+    token = os.getenv("GH_TOKEN")
+    if not token or not repo or not branch or not path:
+        return None, "Missing GH_TOKEN/STATIC_REPO/STATIC_BRANCH/PATH"
+    api = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    sha = None
+    r = requests.get(api, params={"ref": branch}, headers=headers, timeout=30)
+    if r.status_code == 200 and isinstance(r.json(), dict) and "sha" in r.json():
+        sha = r.json()["sha"]
+    payload = {"message": message, "content": base64.b64encode(content_bytes).decode("utf-8"), "branch": branch}
+    if sha: payload["sha"] = sha
+    resp = requests.put(api, headers=headers, json=payload, timeout=60)
+    if resp.status_code not in (200, 201):
+        return None, f"GitHub upload failed: {resp.status_code} {resp.text}"
+    return resp.json(), None
 
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>{title}</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; }}
-    .container {{ max-width: 1400px; margin: 0 auto; padding: 16px; }}
-    .controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0 16px 0; border-bottom: 1px solid #eee; }}
-    .legend-actions {{ margin-left: auto; }}
-    .btn {{ cursor: pointer; background: #f3f3f3; border: 1px solid #ccc; border-radius: 6px; padding: 6px 10px; }}
-    .plotly-graph-div {{ height: 75vh !important; }}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h2>{title}</h2>
-    <div class="controls">
-      <div class="checkboxes">
-        {checkbox_items}
-      </div>
-      <div class="legend-actions">
-        <button class="btn" id="show-all">Show All</button>
-        <button class="btn" id="hide-all">Hide All</button>
-      </div>
-    </div>
-    {figure_html}
-  </div>
-  <script>
-    document.addEventListener("DOMContentLoaded", function() {{
-      var chartDiv = document.querySelector('.plotly-graph-div');
-      var checkboxes = document.querySelectorAll('.series-toggle');
-      function updateVisibility() {{
-        var update = {{"visible": []}};
-        checkboxes.forEach(function(cb, idx) {{
-          update.visible[idx] = cb.checked ? true : "legendonly";
-        }});
-        Plotly.restyle(chartDiv, update);
-      }}
-      checkboxes.forEach(function(cb) {{
-        cb.addEventListener('change', updateVisibility);
-      }});
-      document.getElementById('show-all').addEventListener('click', function() {{
-        checkboxes.forEach(function(cb) {{ cb.checked = true; }});
-        updateVisibility();
-      }});
-      document.getElementById('hide-all').addEventListener('click', function() {{
-        checkboxes.forEach(function(cb) {{ cb.checked = false; }});
-        updateVisibility();
-      }});
-    }});
-  </script>
-</body>
-</html>"""
-    return html
+# ---- Google Drive helpers ----
+def get_drive():
+    if not GDRIVE_AVAILABLE:
+        return None, "Drive libs not installed"
+    b64 = os.getenv("GDRIVE_SA_JSON_B64", "")
+    if not b64:
+        return None, "GDRIVE_SA_JSON_B64 not set"
+    try:
+        data = json.loads(base64.b64decode(b64).decode("utf-8"))
+        creds = service_account.Credentials.from_service_account_info(
+            data, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False), None
+    except Exception as e:
+        return None, f"Drive auth error: {e}"
+
+def upload_to_drive(service, folder_id, name, mimetype, content_bytes, make_public=True):
+    file_metadata = {"name": name, "parents": [folder_id]}
+    media = MediaInMemoryUpload(content_bytes, mimetype=mimetype, resumable=False)
+    file = service.files().create(body=file_metadata, media_body=media, fields="id,webViewLink,webContentLink").execute()
+    file_id = file["id"]
+    if make_public:
+        try:
+            service.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
+        except Exception:
+            pass
+    return file.get("webViewLink"), file_id
 
 @app.route("/", methods=["GET"])
 def index():
-    # Build a simple list of recent hosted HTML viewers
+    # Recent hosted viewers (local Render static)
     exports = []
     try:
-        for p in sorted(EXPORTS_DIR.glob("*.html"), key=lambda x: x.stat().st_mtime, reverse=True)[:20]:
-            exports.append(p.name)
+        for p in sorted(EXPORTS_DIR.glob("*.html"), key=lambda x: x.stat().st_mtime, reverse=True)[:30]:
+            slug = p.stem  # without .html
+            html_url = f"/static/exports/{p.name}"
+            csv_name = f"{slug}.csv"
+            csv_url = f"/static/exports/{csv_name}" if (EXPORTS_DIR / csv_name).exists() else None
+            exports.append({"slug": slug, "html": html_url, "csv": csv_url})
     except Exception:
         pass
-    return render_template("index.html", exports_list=exports)
+
+    # Last pushed links (GitHub/Drive) from latest.json
+    pushed = {}
+    if LATEST_JSON.exists():
+        try:
+            pushed = json.loads(LATEST_JSON.read_text())
+        except Exception:
+            pushed = {}
+
+    site_base = os.getenv("STATIC_SITE_BASE", "").rstrip("/")
+    return render_template("index.html", exports_list=exports, pushed=pushed, site_base=site_base)
 
 @app.route("/process", methods=["POST"])
 def process():
@@ -254,8 +268,6 @@ def process():
 
     other_files = request.files.getlist("other_csvs")
     right_paths = []
-    import tempfile
-    from werkzeug.utils import secure_filename
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         orig_path = tmpdir / secure_filename(original_file.filename)
@@ -283,7 +295,7 @@ def process():
         html = build_plot(merged_df, time_col=time_col, title=title, y1_min=y1_min, y1_max=y1_max, setpoint_name=setpoint_name)
         html_bytes = html.encode("utf-8")
 
-    # ---- EXPORTS SAVE (hosted on /static/exports) ----
+    # Local (Render) save
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     slug = slugify(title)
     hosted_html = EXPORTS_DIR / f"{slug}-{ts}.html"
@@ -291,14 +303,67 @@ def process():
     try:
         hosted_html.write_bytes(html_bytes)
         hosted_csv.write_bytes(csv_buf.getvalue())
-    except Exception as e:
+    except Exception:
         pass
 
+    # ---- GitHub push with optional dated subfolder ----
+    repo   = os.getenv("STATIC_REPO")      # e.g. "yourname/cwloop-viewers"
+    branch = os.getenv("STATIC_BRANCH", "main")
+    base   = os.getenv("STATIC_PATH", "").strip("/")
+    use_dates = os.getenv("STATIC_DATED_SUBFOLDERS", "true").lower() in ("1","true","yes","on")
+    dt = datetime.now(timezone.utc)
+    date_path = f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d}" if use_dates else ""
+
+    def join_path(base, date_path, name):
+        parts = [p for p in [base, date_path, name] if p]
+        return "/".join(parts)
+
+    gh_html_rel = join_path(base, date_path, f"{slug}-{ts}.html")
+    gh_csv_rel  = join_path(base, date_path, f"{slug}-{ts}.csv")
+
+    pushed_links = {"github": {}, "gdrive": {}}
+
+    if repo and os.getenv("GH_TOKEN"):
+        res1, err1 = push_to_github(repo, branch, gh_html_rel, html_bytes, f"Add viewer {slug}-{ts}.html")
+        res2, err2 = push_to_github(repo, branch, gh_csv_rel,  csv_buf.getvalue(), f"Add CSV {slug}-{ts}.csv")
+        site_base = os.getenv("STATIC_SITE_BASE", "").rstrip("/")
+        if not err1 and site_base:
+            pushed_links["github"]["html"] = f"{site_base}/{gh_html_rel}"
+        if not err2 and site_base:
+            pushed_links["github"]["csv"]  = f"{site_base}/{gh_csv_rel}"
+        if err1 or err2:
+            flash(f"GitHub upload warning: {err1 or err2}")
+
+    # ---- Google Drive upload (optional) ----
+    gdrive_folder = os.getenv("GDRIVE_FOLDER_ID", "").strip()
+    if gdrive_folder and GDRIVE_AVAILABLE:
+        service, err = get_drive()
+        if service and not err:
+            try:
+                html_link, _ = upload_to_drive(service, gdrive_folder, f"{slug}-{ts}.html", "text/html", html_bytes, make_public=True)
+                csv_link, _  = upload_to_drive(service, gdrive_folder, f"{slug}-{ts}.csv",  "text/csv",  csv_buf.getvalue(), make_public=True)
+                pushed_links["gdrive"]["html"] = html_link
+                pushed_links["gdrive"]["csv"]  = csv_link
+            except Exception as e:
+                flash(f"Drive upload warning: {e}")
+
+    # Save latest links so index can render copy buttons
+    try:
+        LATEST_JSON.write_text(json.dumps(pushed_links, indent=2))
+    except Exception:
+        pass
+
+    # Return ZIP immediately
     out_zip = BytesIO()
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{title} - merged.csv", csv_buf.getvalue())
         zf.writestr(f"{title} - Trend Viewer.html", html_bytes)
     out_zip.seek(0)
+
+    if pushed_links.get("github") or pushed_links.get("gdrive"):
+        flash("Upload complete — links on the homepage (copy buttons available).")
+    else:
+        flash("Saved to /static/exports and bundled ZIP returned. (Configure Option B env vars to auto-push to GitHub/Drive.)")
 
     return send_file(out_zip, as_attachment=True, download_name=f"{title} - results.zip", mimetype="application/zip")
 

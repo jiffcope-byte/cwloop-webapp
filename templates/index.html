@@ -1,74 +1,140 @@
-<!DOCTYPE html>
-<html lang="en">
+
+<!doctype html>
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta charset="utf-8">
   <title>Trend Merge & Viewer</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"/>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { margin-top: 0; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    label { font-weight: 600; display:block; margin: 8px 0 4px; }
+    input, select { width:100%; padding:8px; box-sizing:border-box; }
+    .btn { background:#111; color:#fff; padding:10px 14px; border:none; border-radius:6px; cursor:pointer; }
+    .btn.secondary { background:#555; }
+    .card { border:1px solid #e5e7eb; border-radius:10px; padding:16px; }
+    .list { margin-top:24px; }
+    .item { display:flex; align-items:center; gap:12px; padding:6px 0; border-bottom:1px dashed #eee; }
+    .small { color:#555; font-size:12px; }
+    .pill { background:#eef2ff; color:#3730a3; padding:2px 8px; border-radius:999px; font-size:12px; }
+    .group { display:flex; gap:8px; align-items:center; }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <h1>Trend Merge & Viewer</h1>
-    <p>Upload your <strong>Original CSV</strong> and any number of <strong>Additional CSVs</strong>. We'll align by the original timestamps, merge values, and return a ZIP with a merged CSV and a standalone Plotly viewer.</p>
-    <form action="{{ url_for('process') }}" method="post" enctype="multipart/form-data" class="card">
-      <label>Original CSV</label>
-      <input type="file" name="original_csv" accept=".csv" required />
+  <h1>Trend Merge & Viewer</h1>
 
-      <label>Additional CSVs (you can select multiple)</label>
-      <input type="file" name="other_csvs" accept=".csv" multiple />
-
-      <div class="grid">
-        <div>
-          <label>Tolerance (seconds)</label>
-          <input type="number" name="tolerance" value="5" min="0" />
-        </div>
-        <div>
-          <label>Title</label>
-          <input type="text" name="title" value="CW Loop" />
-        </div>
-        <div>
-          <label>Y1 Min</label>
-          <input type="number" name="y1_min" value="0" step="0.1" />
-        </div>
-        <div>
-          <label>Y1 Max</label>
-          <input type="number" name="y1_max" value="100" step="0.1" />
-        </div>
+  <form class="card" method="POST" action="/process" enctype="multipart/form-data">
+    <div class="row">
+      <div>
+        <label>Original CSV</label>
+        <input type="file" name="original_csv" required>
       </div>
-
-      <div class="grid">
-        <div>
-          <label>Setpoint Column (optional)</label>
-          <input type="text" name="setpoint_name" placeholder="e.g., Plant Pumps.Active CW Flow Setpoint" />
-        </div>
-        <div>
-          <label>Cutoff Datetime (optional)</label>
-          <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
-        </div>
+      <div>
+        <label>Additional CSVs (you can select multiple)</label>
+        <input type="file" name="other_csvs" multiple>
       </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Tolerance (seconds)</label>
+        <input type="number" name="tolerance" value="5" min="0">
+      </div>
+      <div>
+        <label>Title</label>
+        <input type="text" name="title" value="CW Loop">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Y1 Min</label>
+        <input type="number" name="y1_min" value="0">
+      </div>
+      <div>
+        <label>Y1 Max</label>
+        <input type="number" name="y1_max" value="100">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Setpoint Column (optional)</label>
+        <input type="text" name="setpoint_name" placeholder="e.g., Active CW Flow Setpoint">
+      </div>
+      <div>
+        <label>Cutoff Datetime (optional)</label>
+        <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS">
+      </div>
+    </div>
+    <div style="margin-top:12px;">
+      <button class="btn" type="submit">Process</button>
+    </div>
+  </form>
 
-      <button type="submit">Process</button>
-    </form>
+  <div class="list card">
+    <h3>Recent hosted viewers</h3>
+    {% if exports_list %}
+      {% for item in exports_list %}
+        <div class="item">
+          <span class="pill">{{ item.slug }}</span>
+          <div class="group">
+            <a class="btn secondary" href="{{ item.html }}" target="_blank">View HTML</a>
+            {% if item.csv %}<a class="btn secondary" href="{{ item.csv }}" target="_blank">CSV</a>{% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="small">No hosted viewers yet. Generate one to see it listed here.</div>
+    {% endif %}
+  </div>
 
-      <h2 style="margin-top:28px;">Recent hosted viewers</h2>
-      {% if exports_list and exports_list|length > 0 %}
-        <ul>
-          {% for fname in exports_list %}
-            <li>
-              <a href="{{ url_for('static', filename='exports/' + fname) }}" target="_blank" rel="noopener">
-                {{ fname }}
-              </a>
-            </li>
-          {% endfor %}
-        </ul>
-        <p style="color:#6b7280;font-size:0.9rem;">
-          These files are saved under <code>/static/exports</code> and are publicly accessible.
-          Note: on free Render, files may be cleared on redeploys. For durable hosting, use a Static Site.
-        </p>
-      {% else %}
-        <p style="color:#6b7280;">No hosted viewers yet. Generate one to see it listed here.</p>
+  <div class="list card">
+    <h3>Last cloud uploads (copy links)</h3>
+    {% if pushed.github.html or pushed.github.csv or pushed.gdrive.html or pushed.gdrive.csv %}
+      {% if pushed.github.html or pushed.github.csv %}
+        <div class="item"><strong>GitHub Static</strong></div>
+        {% if pushed.github.html %}
+          <div class="item">
+            <span class="small">HTML</span>
+            <input id="gh_html" type="text" value="{{ pushed.github.html }}" style="flex:1;">
+            <button class="btn" onclick="copy('#gh_html')">Copy</button>
+          </div>
+        {% endif %}
+        {% if pushed.github.csv %}
+          <div class="item">
+            <span class="small">CSV</span>
+            <input id="gh_csv" type="text" value="{{ pushed.github.csv }}" style="flex:1;">
+            <button class="btn" onclick="copy('#gh_csv')">Copy</button>
+          </div>
+        {% endif %}
       {% endif %}
 
+      {% if pushed.gdrive.html or pushed.gdrive.csv %}
+        <div class="item" style="margin-top:8px;"><strong>Google Drive</strong></div>
+        {% if pushed.gdrive.html %}
+          <div class="item">
+            <span class="small">HTML</span>
+            <input id="gd_html" type="text" value="{{ pushed.gdrive.html }}" style="flex:1;">
+            <button class="btn" onclick="copy('#gd_html')">Copy</button>
+          </div>
+        {% endif %}
+        {% if pushed.gdrive.csv %}
+          <div class="item">
+            <span class="small">CSV</span>
+            <input id="gd_csv" type="text" value="{{ pushed.gdrive.csv }}" style="flex:1;">
+            <button class="btn" onclick="copy('#gd_csv')">Copy</button>
+          </div>
+        {% endif %}
+      {% endif %}
+    {% else %}
+      <div class="small">No cloud uploads yet in this session.</div>
+    {% endif %}
   </div>
+
+  <script>
+    function copy(selector){
+      const el = document.querySelector(selector);
+      el.select(); el.setSelectionRange(0, 99999);
+      document.execCommand('copy');
+    }
+  </script>
 </body>
 </html>
