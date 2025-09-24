@@ -1,359 +1,455 @@
 import os
 import io
 import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from itertools import chain
 
 import pandas as pd
-from flask import (
-    Flask, render_template, request, send_file, url_for, redirect, jsonify, abort
-)
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from flask import (
+    Flask, render_template, request, send_file, redirect, url_for,
+    abort, current_app
+)
+from werkzeug.utils import secure_filename
 
 # -----------------------------------------------------------------------------
-# App & Config
+# Flask setup
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Where we save exports that the STATIC site (or this Flask app) can serve
-STATIC_EXPORTS = Path("static/exports")
-STATIC_EXPORTS.mkdir(parents=True, exist_ok=True)
-
-# Optional environment variables (used for hints in the UI only)
-STATIC_SITE_BASE = os.getenv("STATIC_SITE_BASE", "").strip()  # e.g. https://cwloop-static.onrender.com
-STATIC_DATED_SUBFOLDERS = os.getenv("STATIC_DATED_SUBFOLDERS", "true").lower() == "true"
+# Where we publish finished artifacts (served by Flask's static files)
+EXPORTS_ROOT = Path(app.root_path) / "static" / "exports"
+EXPORTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
-TS_COL_CANDIDATES = [
-    " Time Stamp", "Time Stamp", "Timestamp", "DateTime", "Date", "Time", "Date/Time"
+def _strip_prefix(col: str) -> str:
+    """
+    Remove device/file prefixes left of a dot. Keeps the last segment.
+    e.g. "Plant Pumps.Active CW Flow Setpoint" -> "Active CW Flow Setpoint"
+         "Cooling Tower.CT-2 LLC Panel Status" -> "CT-2 LLC Panel Status"
+    """
+    col = col.strip()
+    parts = col.split(".")
+    return parts[-1].strip() if len(parts) > 1 else col
+
+
+def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = df.copy()
+    cleaned.columns = [_strip_prefix(c) for c in cleaned.columns]
+    return cleaned
+
+
+def _try_parse_datetime(series: pd.Series) -> pd.Series | None:
+    try:
+        s = pd.to_datetime(series, errors="coerce", utc=False)
+        if s.notna().sum() >= max(3, int(0.05 * len(s))):  # plausibly real datetimes
+            return s
+    except Exception:
+        pass
+    return None
+
+
+CANDIDATE_TS_NAMES = [
+    " Time Stamp",  # observed in your files (leading space)
+    "Time Stamp",
+    "Timestamp",
+    "DateTime",
+    "Datetime",
+    "date",
+    "time",
 ]
 
-def find_timestamp_column(df: pd.DataFrame) -> str | None:
-    """Find the best timestamp column in a dataframe by common names."""
-    for c in TS_COL_CANDIDATES:
-        if c in df.columns:
-            return c
-    # otherwise, if the first column looks like datetime-like, accept it
-    first = df.columns[0]
-    try:
-        pd.to_datetime(df[first])
-        return first
-    except Exception:
-        return None
 
-def strip_device_prefix(col: str) -> str:
+def _extract_timestamp(df: pd.DataFrame) -> pd.Series:
     """
-    Remove device prefix (anything to the left of the first '.').
-    Example: 'Plant Pumps.Active CW Flow Setpoint' -> 'Active CW Flow Setpoint'
+    Pick the best timestamp column:
+      1) try known names,
+      2) else first datetime-like column,
+      3) else first column coerced to datetime.
+    Returns a timezone-naive pandas datetime64[ns] series.
     """
-    if "." in col:
-        return col.split(".", 1)[1].strip()
-    return col.strip()
+    # 1) Known names
+    for name in CANDIDATE_TS_NAMES:
+        if name in df.columns:
+            s = _try_parse_datetime(df[name])
+            if s is not None:
+                return pd.to_datetime(s).dt.tz_localize(None)
 
-def read_csv_storage(file_storage) -> pd.DataFrame:
-    """Read uploaded CSV (Werkzeug FileStorage) into DataFrame."""
-    raw = file_storage.read()
-    df = pd.read_csv(io.BytesIO(raw), encoding_errors="ignore")
-    return df
-
-def normalize_datetime_index(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
-    """Ensure datetime index from ts_col and sort; drop duplicates keeping first."""
-    df = df.copy()
-    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-    df = df.dropna(subset=[ts_col])
-    df = df.drop_duplicates(subset=[ts_col], keep="first").sort_values(ts_col)
-    df = df.set_index(ts_col)
-    return df
-
-def write_directory_index(dir_path: Path, base_href: str = "") -> None:
-    """
-    Create a simple index.html for a directory to make it browsable.
-    `base_href` is the visible URL prefix (e.g. '/static/exports').
-    """
-    entries = []
-    for p in sorted(dir_path.iterdir()):
-        name = p.name + ("/" if p.is_dir() else "")
-        href = f"{base_href}/{p.name}" if base_href else p.name
-        size = "-" if p.is_dir() else f"{p.stat().st_size:,}"
-        mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        entries.append((name, href, size, mtime))
-
-    html = [
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-        "<title>Index of {}</title>".format(base_href or dir_path.name),
-        "<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;padding:20px} "
-        "table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} "
-        "th{background:#f4f4f4;text-align:left} a{text-decoration:none;color:#0366d6}</style>",
-        "</head><body>",
-        f"<h2>Index of {base_href or dir_path.as_posix()}</h2>",
-        "<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>"
-    ]
-    # Add parent link if not at root of static/exports
-    if dir_path != STATIC_EXPORTS:
-        parent = dir_path.parent
-        parent_href = (base_href.rsplit("/", 1)[0]) if "/" in base_href else ""
-        html.append(f"<tr><td><a href='{parent_href or '.'}'>..</a></td><td>-</td><td>-</td></tr>")
-
-    for name, href, size, mtime in entries:
-        html.append(f"<tr><td><a href='{href}'>{name}</a></td><td>{size}</td><td>{mtime}</td></tr>")
-
-    html.extend(["</tbody></table>",
-                 "<p style='margin-top:20px;color:#666'>Generated by cwloop-webapp</p>",
-                 "</body></html>"])
-
-    (dir_path / "index.html").write_text("\n".join(html), encoding="utf-8")
-
-def build_indexes_recursively(root: Path, base_href="/static/exports") -> None:
-    """Create/refresh index.html in root and all subfolders."""
-    for dirpath, dirnames, filenames in os.walk(root):
-        d = Path(dirpath)
-        relative = d.relative_to(root).as_posix()
-        href = f"{base_href}/{relative}" if relative else base_href
-        write_directory_index(d, base_href=href)
-
-def recent_exports(limit: int = 12):
-    """
-    Return a list of recent export entries:
-    [{'title':..., 'csv_url':..., 'html_url':..., 'folder_url':...}, ...]
-    Scans static/exports/**/ for *.html and *.csv pairs.
-    """
-    results = []
-    for html in STATIC_EXPORTS.rglob("*.html"):
-        if html.name.lower() == "index.html":
+    # 2) First datetime-like
+    for c in df.columns:
+        if c in CANDIDATE_TS_NAMES:
             continue
-        csv = html.with_suffix(".csv")
-        date_folder = html.parents[1].name if html.parent.parent == STATIC_EXPORTS else html.parent.name
-        title = html.stem.replace("-", " ").replace("_", " ").title()
-        rel_dir = html.parent.relative_to(STATIC_EXPORTS).as_posix()
-        results.append({
-            "title": title,
-            "date": date_folder,
-            "html_url": f"/static/exports/{rel_dir}/{html.name}",
-            "csv_url": f"/static/exports/{rel_dir}/{csv.name}" if csv.exists() else None,
-            "folder_url": f"/static/exports/{rel_dir}/",
-        })
-    # sort by modtime desc
-    results.sort(key=lambda x: Path(STATIC_EXPORTS / x["folder_url"].removeprefix("/static/exports/")).stat().st_mtime,
-                 reverse=True)
-    return results[:limit]
+        s = _try_parse_datetime(df[c])
+        if s is not None:
+            return pd.to_datetime(s).dt.tz_localize(None)
 
-def slugify(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    return s.strip("-") or "export"
+    # 3) Fallback to first column
+    first = df.columns[0]
+    s = pd.to_datetime(df[first], errors="coerce")
+    return pd.to_datetime(s).dt.tz_localize(None)
+
+
+def _read_csv_from_file(fstorage) -> pd.DataFrame:
+    # Use filename only for diagnostics—reading from stream
+    content = fstorage.read()
+    fstorage.stream.seek(0)
+    df = pd.read_csv(io.BytesIO(content), encoding="utf-8", engine="python")
+    return df
+
+
+def _align_series_to(orig_index: pd.DatetimeIndex,
+                     s: pd.Series,
+                     tolerance_sec: int) -> pd.Series:
+    """
+    Align a series to the original timestamps by nearest within tolerance.
+    Then forward-fill remaining gaps. Returns a series indexed by orig_index.
+    """
+    s = s.dropna()
+    if s.empty:
+        return pd.Series(index=orig_index, dtype="float64")
+
+    s = s.copy()
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index, errors="coerce")
+    s = s[~s.index.isna()].sort_index()
+
+    aligned = s.reindex(
+        orig_index, method="nearest",
+        tolerance=pd.Timedelta(seconds=max(0, tolerance_sec))
+    )
+    return aligned.ffill()
+
+
+def _build_plot(df: pd.DataFrame,
+                title: str,
+                y1_min: float | None,
+                y1_max: float | None,
+                setpoint_col: str | None) -> go.Figure:
+    fig = go.Figure()
+
+    cols = [c for c in df.columns if c.lower() != "time stamp"]
+    # y2 if specified and present after cleaning
+    y2_col = None
+    if setpoint_col:
+        # Clean setpoint name same way we cleaned headers
+        sp_clean = _strip_prefix(setpoint_col)
+        for c in cols:
+            if _strip_prefix(c).lower() == sp_clean.lower():
+                y2_col = c
+                break
+
+    for c in cols:
+        if c == y2_col:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=df["Time Stamp"], y=df[c], mode="lines",
+                name=_strip_prefix(c), yaxis="y"
+            )
+        )
+
+    if y2_col:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Time Stamp"], y=df[y2_col], mode="lines",
+                name=_strip_prefix(y2_col), yaxis="y2"
+            )
+        )
+
+    fig.update_layout(
+        title=title or "CW Loop",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=50, r=30, t=60, b=40),
+        xaxis=dict(title="Time Stamp"),
+        yaxis=dict(title="Percent"),
+        template="plotly"
+    )
+    if y1_min is not None or y1_max is not None:
+        rng = [
+            y1_min if y1_min is not None else None,
+            y1_max if y1_max is not None else None,
+        ]
+        fig.update_yaxes(range=rng)
+
+    if y2_col:
+        fig.update_layout(
+            yaxis2=dict(
+                title="Setpoint",
+                overlaying="y",
+                side="right",
+                showgrid=False
+            )
+        )
+
+    return fig
+
+
+def _write_export_bundle(df: pd.DataFrame, title: str) -> tuple[str, Path]:
+    """
+    Write merged.csv and viewer.html under:
+      static/exports/YYYY-MM-DD/<slug>/
+    Returns (public_url_to_viewer, folder_path).
+    """
+    day = datetime.now().strftime("%Y-%m-%d")
+    slug = datetime.now().strftime("%H%M%S") + "-" + re.sub(r"[^a-zA-Z0-9\-]+", "-", title or "CW Loop").strip("-")
+    out_dir = EXPORTS_ROOT / day / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_dir / "merged.csv"
+    html_path = out_dir / "viewer.html"
+
+    df.to_csv(csv_path, index=False)
+
+    fig = _build_plot(
+        df,
+        title=title or "CW Loop",
+        y1_min=None, y1_max=None,
+        setpoint_col=None  # already plotted as y2 in _build_plot call above if needed
+    )
+    # Rebuild figure with y2 if present: handled outside when fig built in /process
+
+    # Actually rebuild with the right axes (done in /process below) – we'll pass a fig object.
+    # Here we just save from the fig passed back by /process.
+
+    # Save done in /process; we keep this function for path creation only
+    return (f"/static/exports/{day}/{slug}/viewer.html", out_dir)
+
+
+def _write_index_html(folder: Path, title: str, rows: list[tuple[str, str]]) -> None:
+    """
+    Write a simple index listing.
+    rows: list of (display_text, href)
+    """
+    html = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>{title}</title>",
+        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}"
+        "a{color:#08f;text-decoration:none} a:hover{text-decoration:underline}"
+        "ul{line-height:1.8}</style></head><body>",
+        f"<h2>{title}</h2><ul>"
+    ]
+    for text, href in rows:
+        html.append(f"<li><a href='{href}'>{text}</a></li>")
+    html += ["</ul></body></html>"]
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "index.html").write_text("\n".join(html), encoding="utf-8")
+
+
+def _rebuild_indexes() -> None:
+    """
+    Build:
+      /static/exports/index.html  -> year-month-day folders
+      /static/exports/<day>/index.html -> individual exports
+    """
+    days = sorted([p for p in EXPORTS_ROOT.iterdir() if p.is_dir()])
+    day_rows: list[tuple[str, str]] = []
+    for d in days:
+        # Make per-day index
+        items = sorted([p for p in d.iterdir() if p.is_dir()])
+        rows = []
+        for it in items:
+            viewer = it / "viewer.html"
+            csv = it / "merged.csv"
+            if viewer.exists():
+                label = f"{d.name} / {it.name}"
+                rows.append((f"{label} – View", f"/static/exports/{d.name}/{it.name}/viewer.html"))
+                if csv.exists():
+                    rows.append((f"{label} – CSV", f"/static/exports/{d.name}/{it.name}/merged.csv"))
+        if rows:
+            _write_index_html(d, f"Exports for {d.name}", rows)
+            day_rows.append((d.name, f"/static/exports/{d.name}/"))
+
+    # Top level index
+    if day_rows:
+        # Newest first
+        day_rows = sorted(day_rows, key=lambda x: x[0], reverse=True)
+    _write_index_html(EXPORTS_ROOT, "CW Loop Exports", day_rows)
+
+
+def _form_value(name: str, default: str = "") -> str:
+    v = request.form.get(name, default)
+    return v.strip() if isinstance(v, str) else default
+
+
+def _get_original_file():
+    """
+    Robustly obtain the original CSV file regardless of field name.
+    """
+    files = request.files
+    orig = (
+        files.get("original_csv")
+        or files.get("original")
+        or (next(iter(files.values()), None) if files else None)
+    )
+    if orig and orig.filename and orig.filename.strip():
+        return orig
+    return None
+
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
-def index():
-    """
-    Home page with form and recent exports.
-    Ensures (re)built directory indexes exist at static/exports for browsing.
-    """
-    # Build/refresh top-level index if it doesn't exist
-    try:
-        build_indexes_recursively(STATIC_EXPORTS, base_href="/static/exports")
-    except Exception:
-        # don't block homepage if this fails
-        pass
+def home():
+    # The template shows the form & (optionally) a list of recent exports
+    # If you want the server to inject recent exports, you can glob here and pass into template.
+    # Your existing templates/index.html already expects a list called "exports" (optional).
+    # We'll assemble a few most-recent viewer links:
+    exports = []
+    if EXPORTS_ROOT.exists():
+        days = sorted([d for d in EXPORTS_ROOT.iterdir() if d.is_dir()], reverse=True)
+        for d in days[:7]:
+            for bundle in sorted([b for b in d.iterdir() if b.is_dir()], reverse=True)[:10]:
+                v = bundle / "viewer.html"
+                if v.exists():
+                    exports.append({
+                        "title": f"{d.name}/{bundle.name}",
+                        "view_url": f"/static/exports/{d.name}/{bundle.name}/viewer.html",
+                        "csv_url": f"/static/exports/{d.name}/{bundle.name}/merged.csv",
+                    })
+    return render_template("index.html", exports=exports)
 
-    exports = recent_exports()
-    # Template expects these keys. If you changed your template, adjust here:
-    return render_template(
-        "index.html",
-        exports_list=exports,
-        pushed=False,                    # kept for template compatibility
-        site_base=STATIC_SITE_BASE or "",  # helps show static links
-    )
-
-@app.route("/rebuild-indexes", methods=["POST", "GET"])
-def rebuild_indexes():
-    """Rebuild index.html in static/exports and all subfolders."""
-    build_indexes_recursively(STATIC_EXPORTS, base_href="/static/exports")
-    if request.method == "GET":
-        # For convenience in a browser
-        return redirect(url_for("index"))
-    return jsonify({"status": "ok", "message": "indexes rebuilt"})
 
 @app.route("/process", methods=["POST"])
 def process():
-    """
-    Pipeline:
-    - Read original CSV (global timeline source) & additional CSVs
-    - Use original's ' Time Stamp' (or best-guess) as the global X
-    - Remove device prefixes from column names
-    - Forward-fill sparse data onto global timeline
-    - Save merged CSV + standalone Plotly HTML to static/exports/YYYY-MM-DD/<slug>/
-    """
-    # BEFORE (strict)
-# orig_file = request.files.get('original_csv')
+    # ---- get files robustly
+    orig_file = _get_original_file()
+    if not orig_file:
+        got_keys = list(request.files.keys())
+        return f"Original CSV is required (got file fields: {got_keys})", 400
 
-# AFTER (robust)
-files = request.files
-# Accept common names and fall back to the first file if needed
-orig_file = (
-    files.get('original_csv')
-    or files.get('original')
-    or (next(iter(files.values()), None) if files else None)
-)
+    add_files = request.files.getlist("additional_csvs") or []
 
-if not orig_file or orig_file.filename.strip() == "":
-    # Helpful debug: what DID we get?
-    got_keys = list(files.keys())
-    return f"Original CSV is required (got file fields: {got_keys})", 400
+    # ---- form parameters
+    try:
+        tol_seconds = int(_form_value("tolerance", "5"))
+    except Exception:
+        tol_seconds = 5
 
+    title = _form_value("title", "CW Loop")
+    y1_min = _form_value("y1_min", "")
+    y1_max = _form_value("y1_max", "")
+    y1_min = float(y1_min) if y1_min != "" else None
+    y1_max = float(y1_max) if y1_max != "" else None
 
-    original_file = request.files["original"]
-    addl_files = request.files.getlist("additional") or []
+    setpoint_col = _form_value("setpoint", "") or None
+    cutoff_str = _form_value("cutoff", "")
 
-    # UI params
-    title = (request.form.get("title") or "CW Loop").strip()
-    y1_min = request.form.get("y1_min", "0")
-    y1_max = request.form.get("y1_max", "100")
-    tolerance_s = int(request.form.get("tolerance", "5"))
-    setpoint_col_hint = (request.form.get("setpoint_col") or "").strip()
-    cutoff_dt = (request.form.get("cutoff_dt") or "").strip()
+    # ---- read original df
+    try:
+        orig_df = _read_csv_from_file(orig_file)
+    except Exception as e:
+        return f"Failed reading original CSV: {e}", 400
 
-    # -----------------------------
-    # Read & normalize original CSV
-    # -----------------------------
-    df0 = read_csv_storage(original_file)
-    ts0 = find_timestamp_column(df0)
-    if not ts0:
-        abort(400, "Could not detect a timestamp column in the original CSV")
+    ts = _extract_timestamp(orig_df)
+    if ts.isna().all():
+        return "Could not find a valid timestamp column in the original CSV.", 400
 
-    df0 = normalize_datetime_index(df0, ts0)
+    orig_df["Time Stamp"] = ts.dt.tz_localize(None)
+    orig_df = orig_df.sort_values("Time Stamp").reset_index(drop=True)
 
-    # apply optional cutoff
-    if cutoff_dt:
+    # Optional cutoff
+    if cutoff_str:
         try:
-            cutoff = pd.to_datetime(cutoff_dt)
-            df0 = df0[df0.index >= cutoff]
+            cutoff = pd.to_datetime(cutoff_str)
+            orig_df = orig_df[orig_df["Time Stamp"] >= cutoff].reset_index(drop=True)
         except Exception:
             pass
 
-    # keep only numeric series, strip prefixes
-    numeric_cols0 = [c for c in df0.columns if pd.api.types.is_numeric_dtype(df0[c])]
-    df0 = df0[numeric_cols0]
-    df0 = df0.rename(columns={c: strip_device_prefix(c) for c in df0.columns})
+    # Build the base with original's non-time columns
+    base = orig_df.copy()
+    # Keep all columns except those that look like sequence or duplicate time columns
+    # We'll clean names afterwards
+    # Align index
+    base_index = pd.to_datetime(base["Time Stamp"])
+    base_index = base_index.dt.tz_localize(None)
+    base.set_index("Time Stamp", inplace=True)
 
-    # global index (original)
-    idx = df0.index
+    # Clean original's headers (except index)
+    base = _clean_headers(base)
+    # We'll keep these and then add aligned series from additional files
 
-    # ---------------------------------
-    # Read & align additional CSV files
-    # ---------------------------------
-    aligned = [df0]
-    for f in addl_files:
-        if not f or not f.filename:
+    # ---- ingest additional files
+    for f in add_files:
+        if not f or not f.filename.strip():
             continue
         try:
-            d = read_csv_storage(f)
-            tsc = find_timestamp_column(d) or ts0   # fall back to original's ts name if needed
-            d = normalize_datetime_index(d, tsc)
-            # numeric columns
-            ncols = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
-            d = d[ncols]
-            d = d.rename(columns={c: strip_device_prefix(c) for c in d.columns})
-            # align to global timeline with forward-fill (limit by tolerance if wanted)
-            d = d.reindex(idx).ffill()
-            aligned.append(d)
+            df = _read_csv_from_file(f)
         except Exception:
             continue
 
-    # merge
-    merged = pd.concat(aligned, axis=1)
-    # collapse duplicate columns caused by overlaps by taking first non-null
-    merged = merged.groupby(level=0, axis=1).first()
+        ts_add = _extract_timestamp(df)
+        df["Time Stamp"] = ts_add.dt.tz_localize(None)
+        df = df.sort_values("Time Stamp").dropna(subset=["Time Stamp"])
 
-    # ---------------------------------
-    # Build Plotly figure
-    # ---------------------------------
-    setpoint_lower = setpoint_col_hint.lower() if setpoint_col_hint else ""
-    has_setpoint = None
-    for c in merged.columns:
-        if setpoint_lower and setpoint_lower == c.lower():
-            has_setpoint = c
-            break
+        df = _clean_headers(df)
+        df = df.set_index("Time Stamp")
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    for col in merged.columns:
-        if has_setpoint and col.lower() == has_setpoint.lower():
-            fig.add_trace(
-                go.Scatter(x=merged.index, y=merged[col], name=col, mode="lines"),
-                secondary_y=True
-            )
-        else:
-            fig.add_trace(
-                go.Scatter(x=merged.index, y=merged[col], name=col, mode="lines"),
-                secondary_y=False
-            )
+        # For each column, align onto original timestamps
+        for c in df.columns:
+            s = df[c]
+            aligned = _align_series_to(base_index, s, tol_seconds)
+            base[c] = aligned
 
-    fig.update_layout(
+    # Reset index to have "Time Stamp" column
+    merged = base.reset_index().rename(columns={"index": "Time Stamp"})
+
+    # ---- final clean: remove entirely empty columns
+    keep_cols = ["Time Stamp"] + [c for c in merged.columns if c != "Time Stamp" and merged[c].notna().any()]
+    merged = merged[keep_cols]
+
+    # ---- plot with y2 if requested
+    fig = _build_plot(
+        merged,
         title=title,
-        hovermode="x unified",
-        legend=dict(orientation="h", x=0, y=1.1),
-        margin=dict(l=40, r=20, t=50, b=40),
+        y1_min=y1_min,
+        y1_max=y1_max,
+        setpoint_col=setpoint_col
     )
-    fig.update_xaxes(title_text="Time Stamp")
-    fig.update_yaxes(title_text="Percent", range=[float(y1_min), float(y1_max)], secondary_y=False)
-    fig.update_yaxes(title_text="Setpoint", secondary_y=True)
 
-    # ---------------------------------
-    # Save outputs in dated folder
-    # ---------------------------------
-    today = datetime.now().strftime("%Y-%m-%d")
-    sub = slugify(title)
-    out_dir = STATIC_EXPORTS / today / sub if STATIC_DATED_SUBFOLDERS else STATIC_EXPORTS / sub
+    # ---- write output bundle
+    day = datetime.now().strftime("%Y-%m-%d")
+    slug = datetime.now().strftime("%H%M%S") + "-" + re.sub(r"[^a-zA-Z0-9\-]+", "-", title or "CW Loop").strip("-")
+    out_dir = EXPORTS_ROOT / day / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = out_dir / f"{sub}.csv"
-    html_path = out_dir / f"{sub}.html"
+    csv_path = out_dir / "merged.csv"
+    html_path = out_dir / "viewer.html"
 
-    # Save merged CSV
-    merged.reset_index().rename(columns={"index": "Time Stamp"}).to_csv(csv_path, index=False)
+    merged.to_csv(csv_path, index=False)
+    fig.write_html(html_path, include_plotlyjs="cdn", full_html=True)
 
-    # Save standalone Plotly HTML
-    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+    # Update indexes
+    _rebuild_indexes()
 
-    # Rebuild folder indexes so the static site is browsable immediately
-    try:
-        build_indexes_recursively(STATIC_EXPORTS, base_href="/static/exports")
-    except Exception:
-        pass
+    # Redirect to the viewer
+    return redirect(f"/static/exports/{day}/{slug}/viewer.html")
 
-    # Provide direct links for the UI
-    rel = out_dir.relative_to(STATIC_EXPORTS).as_posix()
-    csv_url = f"/static/exports/{rel}/{csv_path.name}"
-    html_url = f"/static/exports/{rel}/{html_path.name}"
-    folder_url = f"/static/exports/{rel}/"
 
-    # Return to index with a small success flash (template reads exports_list again)
-    exports = recent_exports()
-    return render_template(
-        "index.html",
-        exports_list=exports,
-        pushed=False,
-        site_base=STATIC_SITE_BASE or "",
-        just_built={"title": title, "csv_url": csv_url, "html_url": html_url, "folder_url": folder_url},
-    )
+@app.route("/rebuild-indexes", methods=["GET", "POST"])
+def rebuild_indexes():
+    _rebuild_indexes()
+    # On GET, bounce home so you can see the button works; on POST return JSON-ish text
+    if request.method == "GET":
+        return redirect(url_for("home"))
+    return {"status": "ok", "message": "indexes rebuilt"}
 
-# -----------------------------------------------------------------------------
-# Health
-# -----------------------------------------------------------------------------
-@app.route("/health")
-def health():
-    return "ok", 200
+
+@app.route("/exports")
+def exports_landing():
+    """Convenience: jump straight to the static listing."""
+    # ensure exists
+    _rebuild_indexes()
+    return redirect("/static/exports/")
+
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # For local dev only; Render will use gunicorn
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # For local testing
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
