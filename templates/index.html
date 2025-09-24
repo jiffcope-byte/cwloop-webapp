@@ -1,219 +1,43 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Trend Merge & Viewer</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <style>
-    :root{
-      --bg:#0e1013;--panel:#161a20;--muted:#7b8aa5;--text:#e7edf7;--accent:#5eb0ff;--accent2:#7bd389;
-      --warn:#f5a524;--danger:#ff6b6b;--border:#232a34
-    }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-    a{color:var(--accent);text-decoration:none}
-    a:hover{opacity:.9}
-    .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
-    .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px}
-    h1{font-size:28px;margin:0 0 10px}
-    h2{font-size:18px;margin:0 0 8px;color:#cfe1ff}
-    .muted{color:var(--muted)}
-    .row{display:flex;gap:16px;flex-wrap:wrap}
-    .col{flex:1 1 340px}
-    label{display:block;margin:10px 0 6px}
-    input[type="text"],input[type="number"],input[type="datetime-local"],input[type="file"],select{
-      width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#0f1216;color:var(--text)
-    }
-    input[type="file"]{padding:8px}
-    .hint{font-size:12px;color:var(--muted);margin-top:4px}
-    .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;border:1px solid var(--border);
-      background:#0f1216;color:var(--text);cursor:pointer}
-    .btn.primary{background:var(--accent);border-color:transparent;color:#061325;font-weight:600}
-    .btn.small{padding:6px 10px;font-size:12px}
-    .btn.ghost{background:transparent}
-    .btn:disabled{opacity:.6;cursor:not-allowed}
-    .table{width:100%;border-collapse:collapse}
-    .table th,.table td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:middle}
-    .table th{color:#bcd3ff;text-align:left;font-weight:600}
-    .chip{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);color:var(--muted)}
-    .links{display:flex;gap:8px;flex-wrap:wrap}
-    .copy{border:1px dashed var(--border);padding:6px 8px;border-radius:8px;font-size:12px;color:var(--muted)}
-    .ok{color:var(--accent2)}
-    .warn{color:var(--warn)}
-    .danger{color:var(--danger)}
-    .footer{margin:24px 0;color:var(--muted);font-size:12px}
-    .stack{display:flex;flex-direction:column;gap:10px}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <header style="margin-bottom:14px">
-      <h1>Trend Merge & Viewer</h1>
-      <div class="muted">Upload your <b>Original CSV</b> and any number of <b>Additional CSVs</b>. We’ll align by your chosen timestamp, merge values, output a cleaned CSV, and render a standalone Plotly HTML.</div>
-    </header>
+<meta charset="utf-8" />
+<title>{{ app_title }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+  h1 { margin-top: 0; }
+  .recent { margin-top: 2rem; }
+  .row { margin: .35rem 0; }
+  .row a { margin-right: 1rem; }
+  .muted { color:#666; font-size: .9rem; }
+</style>
 
-    <!-- Uploader -->
-    <section class="card" style="margin-bottom:18px">
-      <h2>Generate a Viewer</h2>
-      <form method="post" enctype="multipart/form-data" action="{{ url_for('process') }}">
-        <div class="row">
-          <div class="col">
-            <label>Original CSV</label>
-            <input type="file" name="original_csv" required />
-            <div class="hint">This defines the global X-axis timestamps (unless your backend overrides with a specific column).</div>
-          </div>
-          <div class="col">
-            <label>Additional CSVs (you can select multiple)</label>
-            <input type="file" name="extra_csvs" multiple />
-            <div class="hint">We’ll align to the global timestamps and forward-fill gaps.</div>
-          </div>
-        </div>
+<h1>{{ app_title }}</h1>
 
-        <div class="row">
-          <div class="col">
-            <label>Tolerance (seconds)</label>
-            <input type="number" name="tolerance" value="5" min="0" step="1" />
-          </div>
-          <div class="col">
-            <label>Title</label>
-            <input type="text" name="title" value="CW Loop" />
-          </div>
-        </div>
+<form method="post" action="/process" enctype="multipart/form-data" style="margin-bottom:2rem;">
+  <div><strong>Original CSV</strong> <input type="file" name="original" required></div>
+  <div style="margin-top:.5rem;">Additional CSVs (multi) <input type="file" name="others" multiple></div>
 
-        <div class="row">
-          <div class="col">
-            <label>Y1 Min</label>
-            <input type="number" name="y1_min" value="0" />
-          </div>
-          <div class="col">
-            <label>Y1 Max</label>
-            <input type="number" name="y1_max" value="100" />
-          </div>
-        </div>
+  <div style="margin-top:.5rem;">Tolerance (seconds) <input type="number" name="tolerance" value="5" style="width:5rem"></div>
+  <div style="margin-top:.5rem;">Title <input type="text" name="title" value="CW Loop" style="width:20rem"></div>
+  <div style="margin-top:.5rem;">Y1 Min <input type="number" step="any" name="y1_min" value="0" style="width:7rem"> 
+       Y1 Max <input type="number" step="any" name="y1_max" value="100" style="width:7rem"></div>
+  <div style="margin-top:.5rem;">Setpoint Column (optional) <input type="text" name="setpoint" placeholder="Active CW Flow Setpoint" style="width:20rem"></div>
+  <div style="margin-top:.5rem;">Cutoff Datetime (optional) <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" style="width:20rem"></div>
+  <div style="margin-top:.75rem;"><button type="submit">Process</button></div>
+</form>
 
-        <div class="row">
-          <div class="col">
-            <label>Setpoint Column (optional)</label>
-            <input type="text" name="setpoint_col" placeholder="e.g., Plant Pumps.Active CW Flow Setpoint" />
-            <div class="hint">If provided, this series will be placed on a secondary Y-axis (y2).</div>
-          </div>
-          <div class="col">
-            <label>Cutoff Datetime (optional)</label>
-            <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
-          </div>
-        </div>
-
-        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
-          <button class="btn primary" type="submit">Process</button>
-          <a class="btn ghost" href="{{ url_for('index') }}">Reset</a>
-          {% if site_base %}
-            <span class="chip">Static site: {{ site_base }}</span>
-          {% endif %}
-        </div>
-      </form>
-    </section>
-
-    <!-- Recent exports -->
-    <section class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <h2 style="margin:0">Recent Exports</h2>
-        <span class="muted">{{ (exports_list|length) if exports_list else 0 }} item(s)</span>
+<div class="recent">
+  <h2>Recent Exports</h2>
+  {% if recents %}
+    {% for r in recents %}
+      <div class="row">
+        <a href="{{ r.html_abs }}">View</a>
+        <a href="{{ r.csv_abs }}" download>CSV</a>
+        <span class="muted">— {{ r.title }} ({{ r.ts }}) — <a href="{{ r.day_abs }}">browse {{ r.day }}</a></span>
       </div>
-
-      {% if not exports_list %}
-        <div class="muted">No exports yet. Generate one above to see it here.</div>
-      {% else %}
-      <div class="stack">
-        <table class="table">
-          <thead>
-            <tr>
-              <th style="width:26%">Title</th>
-              <th style="width:14%">Timestamp</th>
-              <th style="width:22%">Links</th>
-              <th style="width:26%">Copy Links</th>
-              <th style="width:12%">Info</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for item in exports_list %}
-              {% set title = item.get('title','CW Loop') %}
-              {% set ts    = item.get('ts','') %}
-              {% set local = item.get('local') %}
-              {% set static_url = item.get('static_url') %}
-              {% set gh    = item.get('github') %}
-              {% set drv   = item.get('drive') %}
-              {% set size  = item.get('size') %}
-              {% set notes = item.get('notes') %}
-
-              <tr>
-                <td>
-                  <div style="font-weight:600">{{ title }}</div>
-                  {% if notes %}<div class="hint">{{ notes }}</div>{% endif %}
-                </td>
-                <td>
-                  <div>{{ ts }}</div>
-                </td>
-                <td>
-                  <div class="links">
-                    {% if local %}
-                      <a class="btn small" href="{{ local }}" download>Download</a>
-                    {% endif %}
-                    {% if static_url %}
-                      <a class="btn small" href="{{ static_url }}" target="_blank" rel="noopener">Static</a>
-                    {% endif %}
-                    {% if gh %}
-                      <a class="btn small" href="{{ gh }}" target="_blank" rel="noopener">GitHub</a>
-                    {% endif %}
-                    {% if drv %}
-                      <a class="btn small" href="{{ drv }}" target="_blank" rel="noopener">Drive</a>
-                    {% endif %}
-                  </div>
-                </td>
-                <td>
-                  <div class="links">
-                    {% if static_url %}
-                      <button class="btn small" type="button"
-                              onclick="copyTxt('{{ static_url }}', this)">Copy Static</button>
-                    {% endif %}
-                    {% if gh %}
-                      <button class="btn small" type="button"
-                              onclick="copyTxt('{{ gh }}', this)">Copy GitHub</button>
-                    {% endif %}
-                    {% if drv %}
-                      <button class="btn small" type="button"
-                              onclick="copyTxt('{{ drv }}', this)">Copy Drive</button>
-                    {% endif %}
-                  </div>
-                </td>
-                <td>
-                  {% if size %}<div class="chip">{{ size }}</div>{% endif %}
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {% endif %}
-    </section>
-
-    <div class="footer">
-      <span class="muted">Tip:</span> Missing links are okay—this page now tolerates absent <code>github</code> or <code>drive</code> keys.
-    </div>
-  </div>
-
-  <script>
-    async function copyTxt(text, btn){
-      try{
-        await navigator.clipboard.writeText(text);
-        const old = btn.textContent;
-        btn.textContent = "Copied!";
-        btn.classList.add("primary");
-        setTimeout(()=>{btn.textContent = old; btn.classList.remove("primary")}, 1200);
-      }catch(e){
-        alert("Could not copy to clipboard.");
-      }
-    }
-  </script>
-</body>
-</html>
+    {% endfor %}
+  {% else %}
+    <div class="muted">No exports yet. Generate one above.</div>
+  {% endif %}
+</div>

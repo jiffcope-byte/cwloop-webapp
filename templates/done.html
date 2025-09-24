@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>{{ app_title }} – Done</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+  h1 { margin-top: 0; }
+  a.btn { display:inline-block; padding:.45rem .8rem; border:1px solid #444; border-radius:6px; text-decoration:none; }
+  .row { margin:.5rem 0; }
+</style>
+
+<h1>Export created</h1>
+<div class="row"><strong>Title:</strong> {{ title }}</div>
+<div class="row"><a class="btn" href="{{ html_abs }}" target="_blank">View HTML</a></div>
+<div class="row"><a class="btn" href="{{ csv_abs }}" download>Download CSV</a></div>
+<div class="row"><a class="btn" href="{{ day_abs }}">Open day index</a></div>
+<div class="row" style="margin-top:1rem;"><a href="/" class="btn">Back to Home</a></div>
