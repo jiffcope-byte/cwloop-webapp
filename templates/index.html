@@ -1,43 +1,102 @@
 <!doctype html>
-<meta charset="utf-8" />
-<title>{{ app_title }}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
-  h1 { margin-top: 0; }
-  .recent { margin-top: 2rem; }
-  .row { margin: .35rem 0; }
-  .row a { margin-right: 1rem; }
-  .muted { color:#666; font-size: .9rem; }
-</style>
+<html lang="en" class="dark h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Trend Merge & Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+  </script>
+</head>
+<body class="h-full bg-slate-900 text-slate-100">
+  <div class="max-w-5xl mx-auto px-4 py-8">
+    <h1 class="text-3xl font-bold mb-6">Trend Merge &amp; Viewer</h1>
 
-<h1>{{ app_title }}</h1>
-
-<form method="post" action="/process" enctype="multipart/form-data" style="margin-bottom:2rem;">
-  <div><strong>Original CSV</strong> <input type="file" name="original" required></div>
-  <div style="margin-top:.5rem;">Additional CSVs (multi) <input type="file" name="others" multiple></div>
-
-  <div style="margin-top:.5rem;">Tolerance (seconds) <input type="number" name="tolerance" value="5" style="width:5rem"></div>
-  <div style="margin-top:.5rem;">Title <input type="text" name="title" value="CW Loop" style="width:20rem"></div>
-  <div style="margin-top:.5rem;">Y1 Min <input type="number" step="any" name="y1_min" value="0" style="width:7rem"> 
-       Y1 Max <input type="number" step="any" name="y1_max" value="100" style="width:7rem"></div>
-  <div style="margin-top:.5rem;">Setpoint Column (optional) <input type="text" name="setpoint" placeholder="Active CW Flow Setpoint" style="width:20rem"></div>
-  <div style="margin-top:.5rem;">Cutoff Datetime (optional) <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" style="width:20rem"></div>
-  <div style="margin-top:.75rem;"><button type="submit">Process</button></div>
-</form>
-
-<div class="recent">
-  <h2>Recent Exports</h2>
-  {% if recents %}
-    {% for r in recents %}
-      <div class="row">
-        <a href="{{ r.html_abs }}">View</a>
-        <a href="{{ r.csv_abs }}" download>CSV</a>
-        <span class="muted">— {{ r.title }} ({{ r.ts }}) — <a href="{{ r.day_abs }}">browse {{ r.day }}</a></span>
+    <!-- FORM -->
+    <form class="space-y-5 bg-slate-800/60 border border-slate-700 rounded-xl p-6"
+          action="/process" method="POST" enctype="multipart/form-data">
+      <div>
+        <label class="block text-sm font-medium mb-1">Original CSV</label>
+        <input class="block w-full text-sm file:mr-4 file:py-2 file:px-4 file:rounded-md
+                       file:border-0 file:text-sm file:font-semibold
+                       file:bg-indigo-600 file:text-white hover:file:bg-indigo-500
+                       bg-slate-900 border border-slate-700 rounded-md p-2"
+               type="file" name="original_csv" required />
+        <p class="text-xs text-slate-400 mt-1">
+          This defines the global X-axis timestamps.
+        </p>
       </div>
-    {% endfor %}
-  {% else %}
-    <div class="muted">No exports yet. Generate one above.</div>
-  {% endif %}
-</div>
+
+      <div>
+        <label class="block text-sm font-medium mb-1">Additional CSVs (multi)</label>
+        <input class="block w-full text-sm file:mr-4 file:py-2 file:px-4 file:rounded-md
+                       file:border-0 file:text-sm file:font-semibold
+                       file:bg-indigo-600 file:text-white hover:file:bg-indigo-500
+                       bg-slate-900 border border-slate-700 rounded-md p-2"
+               type="file" name="additional_csvs" multiple />
+        <p class="text-xs text-slate-400 mt-1">
+          We’ll align to the global timestamps and forward-fill gaps.
+        </p>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Tolerance (seconds)</label>
+          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+                 type="number" name="tolerance" value="5" min="0" />
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">Title</label>
+          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+                 type="text" name="title" value="CW Loop" />
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">Y1 Min</label>
+          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+                 type="number" name="y1_min" value="0" />
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium mb-1">Y1 Max</label>
+          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+                 type="number" name="y1_max" value="100" />
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-1">Setpoint Column (optional)</label>
+        <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+               type="text" name="setpoint_column" placeholder="Active CW Flow Setpoint" />
+        <p class="text-xs text-slate-400 mt-1">
+          If provided, this series will be plotted on a secondary Y-axis (y2).
+        </p>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-1">Cutoff Datetime (optional)</label>
+        <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
+               type="text" name="cutoff_datetime" placeholder="YYYY-MM-DD HH:MM:SS" />
+      </div>
+
+      <div class="pt-2">
+        <button class="inline-flex items-center gap-2 px-4 py-2 rounded-md
+                       bg-indigo-600 hover:bg-indigo-500 text-white font-semibold"
+                type="submit">
+          Process
+        </button>
+      </div>
+    </form>
+
+    <!-- RECENT EXPORTS -->
+    <div class="mt-8">
+      <h2 class="text-xl font-semibold mb-3">Recent Exports</h2>
+      <div id="recent" class="space-y-2 text-sm text-slate-300">
+        <em>No exports yet. Generate one above to see it here.</em>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
