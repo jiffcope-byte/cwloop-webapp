@@ -1,101 +1,126 @@
 <!doctype html>
-<html lang="en" class="dark h-full">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Trend Merge & Viewer</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = { darkMode: "class" };
-  </script>
+  <style>
+    :root{
+      --bg:#0b0f14; --panel:#121820; --ink:#e6edf3; --muted:#97a3af; --accent:#3b82f6; --accent-2:#22c55e; --line:#1e2630;
+      --btn:#0e141b; --btn-h:#111a23;
+      --input:#0e141b; --input-b:#223042; --chip:#18202a;
+    }
+    *{box-sizing:border-box} html,body{height:100%}
+    body{margin:0; background:var(--bg); color:var(--ink); font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+    a{color:var(--accent); text-decoration:none}
+    .wrap{max-width:1100px; margin:40px auto; padding:0 20px}
+    .card{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px}
+    h1{font-weight:700; font-size:28px; letter-spacing:.2px; margin:0 0 18px}
+    h2{font-weight:600; font-size:16px; margin:10px 0 8px}
+    .grid{display:grid; gap:14px}
+    .two{grid-template-columns: 1fr 1fr}
+    .row{display:flex; gap:10px; align-items:center}
+    .muted{color:var(--muted)}
+    .inp{width:100%; background:var(--input); border:1px solid var(--input-b); color:var(--ink); border-radius:10px; padding:10px 12px}
+    .btn{display:inline-flex; align-items:center; gap:8px; background:var(--accent); color:white; border:0; padding:10px 16px; border-radius:10px; cursor:pointer; font-weight:600}
+    .btn:disabled{opacity:.6; cursor:not-allowed}
+    .btn.secondary{background:var(--btn); border:1px solid var(--input-b)}
+    .btn.secondary:hover{background:var(--btn-h)}
+    .hint{font-size:12px; color:var(--muted)}
+    .list{margin:0; padding:0; list-style:none}
+    .item{display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px dashed var(--line)}
+    .item:last-child{border-bottom:0}
+    .chip{background:var(--chip); border:1px solid var(--input-b); padding:2px 8px; border-radius:999px; font-size:12px}
+    .spacer{height:8px}
+  </style>
 </head>
-<body class="h-full bg-slate-900 text-slate-100">
-  <div class="max-w-5xl mx-auto px-4 py-8">
-    <h1 class="text-3xl font-bold mb-6">Trend Merge &amp; Viewer</h1>
+<body>
+  <div class="wrap">
+    <h1>Trend Merge & Viewer</h1>
 
-    <!-- FORM -->
-    <form class="space-y-5 bg-slate-800/60 border border-slate-700 rounded-xl p-6"
-          action="/process" method="POST" enctype="multipart/form-data">
+    <form class="card grid" method="post" action="/process" enctype="multipart/form-data">
       <div>
-        <label class="block text-sm font-medium mb-1">Original CSV</label>
-        <input class="block w-full text-sm file:mr-4 file:py-2 file:px-4 file:rounded-md
-                       file:border-0 file:text-sm file:font-semibold
-                       file:bg-indigo-600 file:text-white hover:file:bg-indigo-500
-                       bg-slate-900 border border-slate-700 rounded-md p-2"
-               type="file" name="original_csv" required />
-        <p class="text-xs text-slate-400 mt-1">
-          This defines the global X-axis timestamps.
-        </p>
+        <h2>Original CSV</h2>
+        <input class="inp" type="file" name="original" required />
+        <div class="hint">We’ll use this file’s timestamps as the global X-axis.</div>
       </div>
 
       <div>
-        <label class="block text-sm font-medium mb-1">Additional CSVs (multi)</label>
-        <input class="block w-full text-sm file:mr-4 file:py-2 file:px-4 file:rounded-md
-                       file:border-0 file:text-sm file:font-semibold
-                       file:bg-indigo-600 file:text-white hover:file:bg-indigo-500
-                       bg-slate-900 border border-slate-700 rounded-md p-2"
-               type="file" name="additional_csvs" multiple />
-        <p class="text-xs text-slate-400 mt-1">
-          We’ll align to the global timestamps and forward-fill gaps.
-        </p>
+        <h2>Additional CSVs (you can select multiple)</h2>
+        <input class="inp" type="file" name="additionals" multiple />
+        <div class="hint">We’ll align to the global timestamps and forward-fill small gaps.</div>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div class="grid two">
         <div>
-          <label class="block text-sm font-medium mb-1">Tolerance (seconds)</label>
-          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-                 type="number" name="tolerance" value="5" min="0" />
+          <h2>Tolerance (seconds)</h2>
+          <input class="inp" type="number" name="tolerance" value="5" min="0" step="1" />
         </div>
 
         <div>
-          <label class="block text-sm font-medium mb-1">Title</label>
-          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-                 type="text" name="title" value="CW Loop" />
+          <h2>Title</h2>
+          <input class="inp" type="text" name="title" value="CW Loop" />
+        </div>
+      </div>
+
+      <div class="grid two">
+        <div>
+          <h2>Y1 Min</h2>
+          <input class="inp" type="number" name="ymin" value="0" />
         </div>
 
         <div>
-          <label class="block text-sm font-medium mb-1">Y1 Min</label>
-          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-                 type="number" name="y1_min" value="0" />
-        </div>
-
-        <div>
-          <label class="block text-sm font-medium mb-1">Y1 Max</label>
-          <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-                 type="number" name="y1_max" value="100" />
+          <h2>Y1 Max</h2>
+          <input class="inp" type="number" name="ymax" value="100" />
         </div>
       </div>
 
       <div>
-        <label class="block text-sm font-medium mb-1">Setpoint Column (optional)</label>
-        <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-               type="text" name="setpoint_column" placeholder="Active CW Flow Setpoint" />
-        <p class="text-xs text-slate-400 mt-1">
-          If provided, this series will be plotted on a secondary Y-axis (y2).
-        </p>
+        <h2>Setpoint Column (optional)</h2>
+        <input class="inp" type="text" name="setpoint_col" placeholder="e.g., Active CW Flow Setpoint" />
       </div>
 
       <div>
-        <label class="block text-sm font-medium mb-1">Cutoff Datetime (optional)</label>
-        <input class="w-full bg-slate-900 border border-slate-700 rounded-md p-2"
-               type="text" name="cutoff_datetime" placeholder="YYYY-MM-DD HH:MM:SS" />
+        <h2>Cutoff Datetime (optional)</h2>
+        <input class="inp" type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
       </div>
 
-      <div class="pt-2">
-        <button class="inline-flex items-center gap-2 px-4 py-2 rounded-md
-                       bg-indigo-600 hover:bg-indigo-500 text-white font-semibold"
-                type="submit">
-          Process
-        </button>
+      <div class="row">
+        <button class="btn" type="submit">Process</button>
+        <a class="btn secondary" href="/">Reset</a>
+        <span class="hint">Tip: Don’t open <code>/process</code> directly—use this form so the files post correctly.</span>
       </div>
     </form>
 
-    <!-- RECENT EXPORTS -->
-    <div class="mt-8">
-      <h2 class="text-xl font-semibold mb-3">Recent Exports</h2>
-      <div id="recent" class="space-y-2 text-sm text-slate-300">
-        <em>No exports yet. Generate one above to see it here.</em>
-      </div>
+    <div class="spacer"></div>
+
+    <div class="card">
+      <h2>Recent Exports</h2>
+      {% if exports_list and exports_list|length %}
+        <ul class="list">
+          {% for x in exports_list %}
+            <li class="item">
+              <div>
+                <div><strong>{{ x.title }}</strong></div>
+                <div class="hint">{{ x.when }}</div>
+              </div>
+              <div class="row">
+                {% if x.view_url %}
+                  <a class="btn secondary" href="{{ x.view_url }}" target="_blank">View</a>
+                {% endif %}
+                {% if x.csv_url %}
+                  <a class="btn secondary" href="{{ x.csv_url }}" target="_blank">CSV</a>
+                {% endif %}
+                {% if x.zip_url %}
+                  <a class="btn secondary" href="{{ x.zip_url }}" target="_blank">ZIP</a>
+                {% endif %}
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="hint">No exports yet. Generate one above to see it here.</div>
+      {% endif %}
     </div>
   </div>
 </body>
