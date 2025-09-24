@@ -14,3 +14,5 @@ REM Push to GitHub main branch
 git push origin main
 
 pause
+
+cmd /k 
