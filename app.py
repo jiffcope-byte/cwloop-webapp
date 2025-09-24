@@ -191,8 +191,23 @@ def process():
     - Forward-fill sparse data onto global timeline
     - Save merged CSV + standalone Plotly HTML to static/exports/YYYY-MM-DD/<slug>/
     """
-    if "original" not in request.files or request.files["original"].filename == "":
-        abort(400, "Original CSV is required")
+    # BEFORE (strict)
+# orig_file = request.files.get('original_csv')
+
+# AFTER (robust)
+files = request.files
+# Accept common names and fall back to the first file if needed
+orig_file = (
+    files.get('original_csv')
+    or files.get('original')
+    or (next(iter(files.values()), None) if files else None)
+)
+
+if not orig_file or orig_file.filename.strip() == "":
+    # Helpful debug: what DID we get?
+    got_keys = list(files.keys())
+    return f"Original CSV is required (got file fields: {got_keys})", 400
+
 
     original_file = request.files["original"]
     addl_files = request.files.getlist("additional") or []
