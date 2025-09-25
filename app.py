@@ -1,300 +1,372 @@
+# app.py
 import io
 import os
 import re
+import json
+import csv
 import zipfile
-import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import pandas as pd
 from flask import (
-    Flask, render_template, request, send_file, abort, url_for, redirect, flash, make_response
+    Flask, request, render_template, send_file,
+    abort, url_for, redirect, jsonify
 )
+from werkzeug.utils import secure_filename
+
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # -----------------------------------------------------------------------------
 # Flask setup
 # -----------------------------------------------------------------------------
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret")
-
-# Configure uploads (50 MB default; override with MAX_UPLOAD_MB)
-max_mb = int(os.environ.get("MAX_UPLOAD_MB", "50"))
-app.config["MAX_CONTENT_LENGTH"] = max_mb * 1024 * 1024
-
-# A tiny in-memory cache for recent exports (shown on the homepage)
-RECENT: List[dict] = []
-
-# Paths
-ROOT = Path(__file__).parent.resolve()
-STATIC_EXPORTS = ROOT / "static" / "exports"
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_EXPORTS = BASE_DIR / "static" / "exports"
 STATIC_EXPORTS.mkdir(parents=True, exist_ok=True)
 
+app = Flask(__name__, static_folder="static", template_folder="templates")
+
 # -----------------------------------------------------------------------------
-# Helpers
+# Utils
 # -----------------------------------------------------------------------------
-TIME_COL_PRIORITY = [
-    " Time Stamp",  # you mentioned this exact header exists
-    "Time Stamp",
-    "Timestamp",
-    "Date_Time",
-    "Datetime",
-    "DateTime",
-    "Date",
-    "Time"
-]
+def _today_str(dt=None):
+    dt = dt or datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%d")
 
-SEQ_PAT = re.compile(r"^(?:seq|sequence)$", re.IGNORECASE)
+def _ts_for_filename(dt=None):
+    dt = dt or datetime.now(timezone.utc)
+    return dt.strftime("%H%M%S")
 
-def _slug(s: str) -> str:
-    s = re.sub(r"\s+", "_", s.strip())
-    return re.sub(r"[^A-Za-z0-9_\-]+", "", s)
+def _clean_colname(name: str) -> str:
+    """Remove device prefix 'Device.Point' -> 'Point'."""
+    if not isinstance(name, str):
+        return name
+    if "." in name:
+        return name.split(".", 1)[1]
+    return name
 
-def pick_time_column(df: pd.DataFrame) -> Optional[str]:
-    """Pick a sensible time column (prefers known names, otherwise first datetime-like)."""
-    cols = list(df.columns)
+def _likely_time_col(cols):
+    """Pick best timestamp column from a list of names."""
+    candidates = [
+        " Time Stamp", "Time Stamp", "Timestamp", "TimeStamp", "time", "Time"
+    ]
+    lowered = {c.lower(): c for c in cols}
+    for c in candidates:
+        for col in cols:
+            if col.strip().lower() == c.strip().lower():
+                return col
+    # fallback: first column
+    return cols[0]
 
-    # Prefer explicit names
-    for name in TIME_COL_PRIORITY:
-        if name in cols:
-            return name
+def read_csv_to_df(file_storage) -> pd.DataFrame:
+    """Read an uploaded CSV (Windows/Excel friendly), parse dates."""
+    content = file_storage.read()
+    file_storage.stream.seek(0)
 
-    # Otherwise try to infer: pick the first column that parses to many datetimes
-    for c in cols:
+    # Try multiple encodings
+    for enc in ("utf-8-sig", "cp1252", "latin1"):
         try:
-            converted = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True)
-            # If at least half are valid datetimes, use it
-            if converted.notna().sum() >= len(df) * 0.5:
-                return c
+            df = pd.read_csv(io.BytesIO(content), encoding=enc)
+            break
         except Exception:
-            continue
+            df = None
+    if df is None:
+        raise ValueError("Unable to read CSV (encoding issue).")
 
-    return None
+    # Choose a time column then parse
+    tcol = _likely_time_col(list(df.columns))
+    # some CSVs put timestamps in the second column
+    # (your earlier note). If the first guess fails to parse,
+    # try the second column.
+    try:
+        ts = pd.to_datetime(df[tcol], errors="coerce")
+        if ts.notna().sum() == 0 and len(df.columns) >= 2:
+            # try second column as time
+            tcol2 = df.columns[1]
+            ts2 = pd.to_datetime(df[tcol2], errors="coerce")
+            if ts2.notna().sum() > 0:
+                tcol = tcol2
+                ts = ts2
+    except Exception:
+        if len(df.columns) >= 2:
+            tcol = df.columns[1]
+            ts = pd.to_datetime(df[tcol], errors="coerce")
+        else:
+            raise
 
-def read_csv_filestorage(fs) -> pd.DataFrame:
-    """Read a werkzeug FileStorage into a DataFrame robustly."""
-    fs.stream.seek(0)
-    data = fs.read()
-    bio = io.BytesIO(data)
+    df = df.copy()
+    df.index = ts
+    df.drop(columns=[tcol], inplace=True, errors="ignore")
+    df = df[~df.index.duplicated(keep="first")]
+    df = df.sort_index()
 
-    # Try a few forgiving combos
-    for kwargs in (
-        dict(sep=None, engine="python", on_bad_lines="skip", encoding="utf-8-sig"),
-        dict(sep=None, engine="python", on_bad_lines="skip", encoding_errors="ignore"),
-        dict(sep=None, engine="python", on_bad_lines="skip"),
-    ):
-        bio.seek(0)
-        try:
-            df = pd.read_csv(bio, **kwargs)
-            return df
-        except Exception:
-            continue
-
-    # Final attempt (let pandas guess)
-    bio.seek(0)
-    return pd.read_csv(bio)
-
-def coerce_time_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure DataFrame index is a datetime index using the chosen time column."""
-    time_col = pick_time_column(df)
-    if not time_col:
-        raise ValueError("Could not determine a time column in one of the CSVs.")
-
-    ts = pd.to_datetime(df[time_col], errors="coerce", infer_datetime_format=True)
-    if ts.isna().all():
-        raise ValueError(f"Timestamp column '{time_col}' could not be parsed.")
-
-    out = df.copy()
-    out.index = ts
-    out.drop(columns=[time_col], inplace=True)  # keep only series columns
-    out = out[~out.index.isna()]
-    out.sort_index(inplace=True)
-    return out
-
-def drop_sequence_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop any columns that look like 'Sequence' (case-insensitive)."""
-    bad = [c for c in df.columns if SEQ_PAT.match(str(c).strip())]
-    return df.drop(columns=bad, errors="ignore")
-
-def merge_on_global_time(
-    base: pd.DataFrame,
-    others: List[pd.DataFrame],
-    tolerance_s: int
-) -> pd.DataFrame:
-    """Outer-join others onto base and forward-fill small gaps."""
-    df = base.copy()
-    for add in others:
-        df = df.join(add, how="outer")
-
-    # Forward fill within tolerance (seconds)
-    if tolerance_s > 0:
-        df = df.sort_index().ffill(limit=int(tolerance_s))
-
+    # Drop entirely NA columns, clean names, and ignore "Sequence"
+    df = df.dropna(axis=1, how="all")
+    df.columns = [_clean_colname(c) for c in df.columns]
+    df = df[[c for c in df.columns if str(c).strip().lower() != "sequence"]]
     return df
 
-def to_two_axes(df: pd.DataFrame, setpoint_col: Optional[str]) -> Tuple[List[str], List[str]]:
-    """Split columns between axis 1 and axis 2 if a setpoint is present."""
-    cols = list(df.columns)
-    if setpoint_col and setpoint_col in cols:
-        y2 = [setpoint_col]
-        y1 = [c for c in cols if c != setpoint_col]
-    else:
-        y1, y2 = cols, []
-    return y1, y2
+def align_to_reference(ref_index: pd.DatetimeIndex, df: pd.DataFrame, tolerance_s=5) -> pd.DataFrame:
+    """Nearest align to reference timestamps within tolerance, then forward-fill."""
+    if df.empty:
+        return pd.DataFrame(index=ref_index)
+    left = pd.DataFrame(index=ref_index).reset_index().rename(columns={"index": "ref_ts"})
+    right = df.reset_index().rename(columns={"index": "ts"})
+    # Merge asof with nearest match
+    merged = pd.merge_asof(
+        left.sort_values("ref_ts"),
+        right.sort_values("ts"),
+        left_on="ref_ts",
+        right_on="ts",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=int(tolerance_s))
+    )
+    merged = merged.set_index("ref_ts")
+    merged.drop(columns=["ts"], inplace=True, errors="ignore")
+    # Forward fill where we didn't get a match
+    merged = merged.ffill()
+    merged.index.name = None
+    return merged
 
-def write_export_bundle(
-    title: str,
-    merged: pd.DataFrame,
-    y1_cols: List[str],
-    y2_cols: List[str],
-) -> Tuple[Path, Path, Path]:
-    """Write CSV, HTML (plotly), and ZIP into dated folder. Return paths."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    export_dir = STATIC_EXPORTS / today / _slug(title)
-    export_dir.mkdir(parents=True, exist_ok=True)
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    csv_path = export_dir / "merged.csv"
-    html_path = export_dir / f"{_slug(title)}.html"
-    zip_path = export_dir / f"{_slug(title)}.zip"
+def write_browse_index(root_dir: Path, site_title="Exports"):
+    """Write /static/exports/index.html and per-date indexes."""
+    root_dir = Path(root_dir)
+    dates = sorted([p for p in root_dir.iterdir() if p.is_dir()])
+    # Top-level index
+    top = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>{site_title}</title>",
+        "<style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;background:#0f1116;color:#e6e6e6}a{color:#8bd5ff;text-decoration:none}a:hover{text-decoration:underline}",
+        "h1,h2{font-weight:600}ul{line-height:1.8}</style></head><body>",
+        f"<h1>{site_title}</h1>",
+        "<ul>"
+    ]
+    for d in dates:
+        rel = f"{d.name}/index.html"
+        top.append(f"<li><a href='{rel}'>{d.name}</a></li>")
+    top += ["</ul>", "</body></html>"]
+    (root_dir / "index.html").write_text("\n".join(top), encoding="utf-8")
 
-    # CSV
-    merged_out = merged.copy()
-    merged_out.index.name = "Time Stamp"
-    merged_out.to_csv(csv_path)
+    # Per-date indexes
+    for d in dates:
+        items = sorted([p for p in d.iterdir() if p.is_file()])
+        lines = [
+            "<!doctype html><html><head><meta charset='utf-8'>",
+            f"<title>{site_title} — {d.name}</title>",
+            "<style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;background:#0f1116;color:#e6e6e6}a{color:#8bd5ff;text-decoration:none}a:hover{text-decoration:underline}",
+            "h1,h2{font-weight:600}ul{line-height:1.8}</style></head><body>",
+            f"<h1>{d.name}</h1>",
+            "<p><a href='../index.html'>⬅ Back</a></p>",
+            "<ul>"
+        ]
+        for f in items:
+            lines.append(f"<li><a href='{f.name}'>{f.name}</a></li>")
+        lines += ["</ul>", "</body></html>"]
+        (d / "index.html").write_text("\n".join(lines), encoding="utf-8")
 
-    # Plotly
-    fig = make_subplots(specs=[[{"secondary_y": bool(y2_cols)}]])
-    for col in y1_cols:
-        if col in merged.columns:
-            fig.add_trace(go.Scatter(x=merged.index, y=merged[col], name=col, mode="lines"))
+def recent_exports(limit=12):
+    """Return list of (title, date, html_rel_url, csv_rel_url)."""
+    results = []
+    if not STATIC_EXPORTS.exists():
+        return results
+    for d in sorted(STATIC_EXPORTS.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.html"), reverse=True):
+            stem = f.stem
+            csv_path = f.with_suffix(".csv")
+            results.append({
+                "date": d.name,
+                "title": stem,
+                "html_url": f"/static/exports/{d.name}/{f.name}",
+                "csv_url": f"/static/exports/{d.name}/{csv_path.name}" if csv_path.exists() else ""
+            })
+            if len(results) >= limit:
+                return results
+    return results
+
+# -----------------------------------------------------------------------------
+# Plotly builder (unified hover)
+# -----------------------------------------------------------------------------
+def build_plot(merged: pd.DataFrame, title: str, y2_cols=None, y1_min=None, y1_max=None):
+    y2_cols = y2_cols or []
+    has_y2 = any(col in merged.columns for col in y2_cols)
+    fig = make_subplots(specs=[[{"secondary_y": has_y2}]])
+
+    # Left axis
+    for col in merged.columns:
+        if col in y2_cols:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=merged.index, y=merged[col], name=col, mode="lines",
+                hovertemplate="%{fullData.name}: %{y:.2f}<extra></extra>"
+            ),
+            secondary_y=False
+        )
+
+    # Right axis
     for col in y2_cols:
         if col in merged.columns:
             fig.add_trace(
-                go.Scatter(x=merged.index, y=merged[col], name=col, mode="lines"),
+                go.Scatter(
+                    x=merged.index, y=merged[col], name=col, mode="lines",
+                    hovertemplate="%{fullData.name}: %{y:.2f}<extra></extra>"
+                ),
                 secondary_y=True
             )
 
     fig.update_layout(
         title=title,
         template="plotly_white",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=30, r=20, t=60, b=40),
+        hovermode="x unified",       # <<< one tooltip with all series
+        hoverdistance=0,
+        hoverlabel=dict(namelength=-1)
     )
-    fig.update_xaxes(title="Time Stamp")
-    fig.update_yaxes(title="Percent", secondary_y=False)
-    if y2_cols:
-        fig.update_yaxes(title="Setpoint / Secondary", secondary_y=True)
+    fig.update_xaxes(
+        title="Time Stamp",
+        showspikes=True, spikemode="across", spikesnap="cursor", spikethickness=1
+    )
+    fig.update_yaxes(title="Percent", secondary_y=False, showspikes=True, spikemode="across")
+    if has_y2:
+        fig.update_yaxes(title="Setpoint / Secondary", secondary_y=True, showspikes=True, spikemode="across")
 
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(fig.to_html(full_html=True, include_plotlyjs="cdn"))
+    if y1_min is not None or y1_max is not None:
+        rng = [y1_min if y1_min is not None else None, y1_max if y1_max is not None else None]
+        fig.update_yaxes(range=rng, secondary_y=False)
 
-    # ZIP (CSV + HTML)
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.write(csv_path, arcname="merged.csv")
-        z.write(html_path, arcname=html_path.name)
-
-    return csv_path, html_path, zip_path
-
-def add_recent(title: str, csv_url: str, html_url: str, zip_url: str):
-    RECENT.insert(0, dict(
-        title=title,
-        when=datetime.now().strftime("%b %d, %Y %I:%M %p"),
-        csv_url=csv_url,
-        view_url=html_url,
-        zip_url=zip_url,
-    ))
-    # Keep last 10
-    del RECENT[10:]
+    return fig
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html", exports_list=RECENT, pushed=False, site_base=None)
-
-@app.errorhandler(Exception)
-def on_error(e):
-    # Log full traceback to Render logs
-    traceback.print_exc()
-    # Friendly page in browser with the root message (no stack)
-    msg = str(e) or e.__class__.__name__
-    return make_response(
-        render_template(
-            "index.html",
-            exports_list=RECENT,
-            pushed=False,
-            site_base=None,
-            error=f"Processing error: {msg}"
-        ),
-        500
-    )
+    # Recent export cards for the UI
+    exports = recent_exports(10)
+    return render_template("index.html", exports_list=exports)
 
 @app.route("/process", methods=["POST"])
 def process():
-    # --- Read inputs safely ---------------------------------------------------
-    original = request.files.get("original")
-    if not original or original.filename == "":
-        abort(400, "Original CSV is required")
+    if "original_csv" not in request.files:
+        abort(400, description="Original CSV is required")
+    orig_file = request.files["original_csv"]
+    if not orig_file or orig_file.filename.strip() == "":
+        abort(400, description="Original CSV is required")
 
-    additionals = request.files.getlist("additionals") or []
+    # Form inputs
     tolerance_s = int(request.form.get("tolerance", "5") or 5)
-    title = request.form.get("title", "CW Loop").strip() or "CW Loop"
-    y_min = float(request.form.get("ymin", "0") or 0)
-    y_max = float(request.form.get("ymax", "100") or 100)
+    title = (request.form.get("title") or "CW Loop").strip()
+    y1_min = request.form.get("y1_min")
+    y1_max = request.form.get("y1_max")
+    y1_min = float(y1_min) if y1_min not in (None, "",) else None
+    y1_max = float(y1_max) if y1_max not in (None, "",) else None
     setpoint_col = (request.form.get("setpoint_col") or "").strip()
-    cutoff_raw = (request.form.get("cutoff") or "").strip()
-
-    # --- Load CSVs ------------------------------------------------------------
-    base_raw = read_csv_filestorage(original)
-    base_raw = drop_sequence_columns(base_raw)
-    base = coerce_time_index(base_raw)
-
-    others: List[pd.DataFrame] = []
-    for fs in additionals:
-        if not fs or fs.filename == "":
-            continue
-        df = read_csv_filestorage(fs)
-        df = drop_sequence_columns(df)
-        df = coerce_time_index(df)
-        others.append(df)
-
-    # --- Optional cutoff ------------------------------------------------------
-    if cutoff_raw:
+    cutoff_ts = (request.form.get("cutoff_dt") or "").strip()
+    if cutoff_ts:
         try:
-            cutoff = pd.to_datetime(cutoff_raw)
-            base = base[base.index <= cutoff]
-            others = [d[d.index <= cutoff] for d in others]
+            cutoff_ts = pd.to_datetime(cutoff_ts)
         except Exception:
-            # Don't fail just because cutoff didn't parse
-            pass
+            cutoff_ts = None
+    else:
+        cutoff_ts = None
 
-    # --- Merge & axis split ---------------------------------------------------
-    merged = merge_on_global_time(base, others, tolerance_s=tolerance_s)
+    # Load original (reference) CSV
+    ref_df = read_csv_to_df(orig_file)
 
-    # Clean column names: remove device prefix up to first "."
-    renamed = {}
-    for c in merged.columns:
-        s = str(c)
-        renamed[c] = s.split(".", 1)[1] if "." in s else s
-    merged.rename(columns=renamed, inplace=True)
+    # Apply cutoff
+    if cutoff_ts:
+        ref_df = ref_df.loc[ref_df.index <= cutoff_ts]
 
-    y1_cols, y2_cols = to_two_axes(merged, setpoint_col=setpoint_col)
+    # Prepare merged frame anchored to the original timestamps
+    ref_index = ref_df.index
+    merged = pd.DataFrame(index=ref_index)
 
-    # --- Write bundle ---------------------------------------------------------
-    csv_path, html_path, zip_path = write_export_bundle(title, merged, y1_cols, y2_cols)
+    # Include *only* real process columns from original (Sequence was already removed)
+    for col in ref_df.columns:
+        merged[col] = ref_df[col]
 
-    # --- Add to Recent and render page with links -----------------------------
-    # URLs for static
-    # (Render serves /static/** already)
-    csv_url  = url_for("static", filename=str(csv_path.relative_to(ROOT / "static")).replace("\\", "/"))
-    html_url = url_for("static", filename=str(html_path.relative_to(ROOT / "static")).replace("\\", "/"))
-    zip_url  = url_for("static", filename=str(zip_path.relative_to(ROOT / "static")).replace("\\", "/"))
+    # Load & align additional CSVs
+    add_files = request.files.getlist("additional_csvs")
+    for f in add_files:
+        if not f or not f.filename:
+            continue
+        df = read_csv_to_df(f)
+        if cutoff_ts:
+            df = df.loc[df.index <= cutoff_ts]
+        aligned = align_to_reference(ref_index, df, tolerance_s)
+        # Overlay columns into merged (clean names already done in reader)
+        for col in aligned.columns:
+            # If duplicate name, disambiguate by appending a suffix
+            out_col = col
+            k = 2
+            while out_col in merged.columns:
+                out_col = f"{col} ({k})"
+                k += 1
+            merged[out_col] = aligned[col]
 
-    add_recent(title, csv_url, html_url, zip_url)
+    # Secondary axis series (setpoint) if present in merged
+    y2_cols = []
+    if setpoint_col:
+        # Try to find by exact or case-insensitive match
+        exact = setpoint_col
+        ci = {c.lower(): c for c in merged.columns}
+        match = ci.get(setpoint_col.lower(), None)
+        if match:
+            y2_cols = [match]
 
-    # Immediately send the HTML for convenience and show links on home
-    resp = make_response(send_file(html_path, mimetype="text/html"))
-    return resp
+    # Build figure (unified hover)
+    fig = build_plot(merged, title=title, y2_cols=y2_cols, y1_min=y1_min, y1_max=y1_max)
+
+    # Save outputs
+    day_dir = ensure_dir(STATIC_EXPORTS / _today_str())
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", title).strip("_") or "CW_Loop"
+    stem = f"{stem}_{_ts_for_filename()}"
+    csv_path = day_dir / f"{stem}.csv"
+    html_path = day_dir / f"{stem}.html"
+
+    # Write CSV
+    merged.to_csv(csv_path, index_label="Time Stamp")
+
+    # Write HTML
+    fig.write_html(html_path, include_plotlyjs="cdn", full_html=True)
+
+    # Update browse indexes
+    write_browse_index(STATIC_EXPORTS, site_title="CW Loop Exports")
+
+    # Build links for the UI
+    html_rel = f"/static/exports/{day_dir.name}/{html_path.name}"
+    csv_rel = f"/static/exports/{day_dir.name}/{csv_path.name}"
+
+    # Render homepage with the new item at the top (no redirects needed)
+    exports = recent_exports(10)
+    return render_template(
+        "index.html",
+        exports_list=exports,
+        pushed=True,
+        latest_title=stem,
+        latest_html_url=html_rel,
+        latest_csv_url=csv_rel
+    )
+
+@app.route("/rebuild_indexes", methods=["POST", "GET"])
+def rebuild_indexes():
+    """Re-scan /static/exports and rebuild index pages."""
+    write_browse_index(STATIC_EXPORTS, site_title="CW Loop Exports")
+    if request.method == "GET":
+        return redirect(url_for("index"))
+    return jsonify({"ok": True})
+
+# -----------------------------------------------------------------------------
+# Run
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # For local dev
+    app.run(host="0.0.0.0", port=5000, debug=True)
