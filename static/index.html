@@ -1,34 +1,32 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CW Loop – Exports</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Trend Merge & Viewer — Static Exports</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin: 0; font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background:#0b0f14; color:#e6edf3;}
-    header { padding: 32px 20px; border-bottom:1px solid #1f2937;}
-    h1 { margin: 0 0 6px 0; font-size: 22px;}
-    main { max-width: 900px; margin: 24px auto; padding: 0 20px;}
-    .card { background:#0f1621; border:1px solid #1f2937; border-radius:12px; padding:18px; }
-    a.btn { display:inline-block; padding:10px 14px; border-radius:8px; background:#2563eb; color:#fff; text-decoration:none; }
-    a.btn:hover{ filter:brightness(1.08); }
-    .muted { color:#94a3b8; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 28px; background:#0f1116; color:#e6e6e6; }
+    .wrap { max-width: 880px; margin: 0 auto; }
+    h1 { font-weight: 650; margin: 0 0 12px; }
+    p  { color:#b6b6b6; }
+    .card { background:#12151d; border:1px solid #242938; border-radius:14px; padding:20px; margin-top:18px; }
+    a.btn { display:inline-block; padding:10px 16px; border-radius:10px; border:1px solid #2a3142; text-decoration:none; color:#e6e6e6; background:#1a1f2c; margin-right:10px }
+    a.btn.primary { background:#2262ff; border-color:#2262ff; }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Trend Merge & Viewer — Static Exports</h1>
-    <div class="muted">Browse exports this app publishes under <code>/static/exports/&lt;YYYY-MM-DD&gt;/</code></div>
-  </header>
-  <main>
+  <div class="wrap">
+    <h1>Trend Merge &amp; Viewer — Static Exports</h1>
+    <p>Browse exports published under <code>/static/exports/&lt;YYYY-MM-DD&gt;/</code>. Or open the web app to create a new one.</p>
+
     <div class="card">
-      <p>When you create a report from the web app, it will publish files into the <code>/exports</code> directory here.</p>
       <p>
-        <a class="btn" href="/exports/">Open exports folder</a>
+        <a class="btn primary" href="/exports/">Open exports folder</a>
+        <!-- Change this to your web app URL if you’d like a one-click link -->
+        <a class="btn" href="https://cwloop-webapp.onrender.com/">Open Upload Form</a>
       </p>
-      <p class="muted">If that page says “Not Found”, you haven’t published any exports yet today.</p>
     </div>
-  </main>
+  </div>
 </body>
 </html>
