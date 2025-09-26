@@ -1,19 +1,34 @@
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>CW Loop Exports</title>
-    <meta http-equiv="refresh" content="0; url=/exports/">
-    <style>
-      body { background:#0b0f15; color:#cbd5e1; font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif; }
-      a { color:#93c5fd; }
-      .box { max-width:720px; margin:15vh auto; padding:24px; background:#111827; border-radius:12px; }
-    </style>
-  </head>
-  <body>
-    <div class="box">
-      <h1>Redirecting to Exports…</h1>
-      <p>If you are not redirected automatically, <a href="/exports/">click here to browse exports</a>.</p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CW Loop – Exports</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background:#0b0f14; color:#e6edf3;}
+    header { padding: 32px 20px; border-bottom:1px solid #1f2937;}
+    h1 { margin: 0 0 6px 0; font-size: 22px;}
+    main { max-width: 900px; margin: 24px auto; padding: 0 20px;}
+    .card { background:#0f1621; border:1px solid #1f2937; border-radius:12px; padding:18px; }
+    a.btn { display:inline-block; padding:10px 14px; border-radius:8px; background:#2563eb; color:#fff; text-decoration:none; }
+    a.btn:hover{ filter:brightness(1.08); }
+    .muted { color:#94a3b8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Trend Merge & Viewer — Static Exports</h1>
+    <div class="muted">Browse exports this app publishes under <code>/static/exports/&lt;YYYY-MM-DD&gt;/</code></div>
+  </header>
+  <main>
+    <div class="card">
+      <p>When you create a report from the web app, it will publish files into the <code>/exports</code> directory here.</p>
+      <p>
+        <a class="btn" href="/exports/">Open exports folder</a>
+      </p>
+      <p class="muted">If that page says “Not Found”, you haven’t published any exports yet today.</p>
     </div>
-  </body>
+  </main>
+</body>
 </html>
