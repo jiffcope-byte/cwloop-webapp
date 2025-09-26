@@ -76,13 +76,10 @@ def read_csv_to_df(file_storage) -> pd.DataFrame:
 
     # Choose a time column then parse
     tcol = _likely_time_col(list(df.columns))
-    # some CSVs put timestamps in the second column
-    # (your earlier note). If the first guess fails to parse,
-    # try the second column.
+    # Some CSVs put timestamps in the second column; try that if needed
     try:
         ts = pd.to_datetime(df[tcol], errors="coerce")
         if ts.notna().sum() == 0 and len(df.columns) >= 2:
-            # try second column as time
             tcol2 = df.columns[1]
             ts2 = pd.to_datetime(df[tcol2], errors="coerce")
             if ts2.notna().sum() > 0:
@@ -226,7 +223,7 @@ def build_plot(merged: pd.DataFrame, title: str, y2_cols=None, y1_min=None, y1_m
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=30, r=20, t=60, b=40),
-        hovermode="x unified",       # <<< one tooltip with all series
+        hovermode="x unified",
         hoverdistance=0,
         hoverlabel=dict(namelength=-1)
     )
@@ -255,21 +252,22 @@ def index():
 
 @app.route("/process", methods=["POST"])
 def process():
-    if "original_csv" not in request.files:
+    # ---- use the original dark-mode form names ----
+    if "original" not in request.files:
         abort(400, description="Original CSV is required")
-    orig_file = request.files["original_csv"]
+    orig_file = request.files.get("original")
     if not orig_file or orig_file.filename.strip() == "":
         abort(400, description="Original CSV is required")
 
-    # Form inputs
+    # Form inputs (names from your template)
     tolerance_s = int(request.form.get("tolerance", "5") or 5)
     title = (request.form.get("title") or "CW Loop").strip()
-    y1_min = request.form.get("y1_min")
-    y1_max = request.form.get("y1_max")
+    y1_min = request.form.get("ymin")
+    y1_max = request.form.get("ymax")
     y1_min = float(y1_min) if y1_min not in (None, "",) else None
     y1_max = float(y1_max) if y1_max not in (None, "",) else None
     setpoint_col = (request.form.get("setpoint_col") or "").strip()
-    cutoff_ts = (request.form.get("cutoff_dt") or "").strip()
+    cutoff_ts = (request.form.get("cutoff") or "").strip()
     if cutoff_ts:
         try:
             cutoff_ts = pd.to_datetime(cutoff_ts)
@@ -282,29 +280,28 @@ def process():
     ref_df = read_csv_to_df(orig_file)
 
     # Apply cutoff
-    if cutoff_ts:
+    if cutoff_ts is not None:
         ref_df = ref_df.loc[ref_df.index <= cutoff_ts]
 
     # Prepare merged frame anchored to the original timestamps
     ref_index = ref_df.index
     merged = pd.DataFrame(index=ref_index)
 
-    # Include *only* real process columns from original (Sequence was already removed)
+    # Include *only* real process columns from original (Sequence already removed)
     for col in ref_df.columns:
         merged[col] = ref_df[col]
 
     # Load & align additional CSVs
-    add_files = request.files.getlist("additional_csvs")
+    add_files = request.files.getlist("additionals")
     for f in add_files:
         if not f or not f.filename:
             continue
         df = read_csv_to_df(f)
-        if cutoff_ts:
+        if cutoff_ts is not None:
             df = df.loc[df.index <= cutoff_ts]
         aligned = align_to_reference(ref_index, df, tolerance_s)
         # Overlay columns into merged (clean names already done in reader)
         for col in aligned.columns:
-            # If duplicate name, disambiguate by appending a suffix
             out_col = col
             k = 2
             while out_col in merged.columns:
@@ -315,8 +312,6 @@ def process():
     # Secondary axis series (setpoint) if present in merged
     y2_cols = []
     if setpoint_col:
-        # Try to find by exact or case-insensitive match
-        exact = setpoint_col
         ci = {c.lower(): c for c in merged.columns}
         match = ci.get(setpoint_col.lower(), None)
         if match:
