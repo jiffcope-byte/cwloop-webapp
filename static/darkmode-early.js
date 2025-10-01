@@ -1,7 +1,3 @@
-/**
- * Sets <html class="dark"> early, before paint.
- * Honors localStorage 'theme' or the user's system preference.
- */
 (function () {
   try {
     var t = localStorage.getItem('theme');

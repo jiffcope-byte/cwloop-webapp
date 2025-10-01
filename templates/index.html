@@ -3,62 +3,100 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CWLoop Webapp – Dark Mode + /process Fix</title>
-
-    <!-- EARLY THEME: must be first to avoid flash and ensure dark applies -->
+    <title>Trend Merge & Viewer</title>
     <script src="/static/darkmode-early.js"></script>
-
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <header class="container">
-      <h1>CWLoop Webapp</h1>
-      <button id="themeToggle" class="btn">Toggle theme</button>
-    </header>
+    <div class="container">
+      <header class="topbar">
+        <h1>Trend Merge & Viewer</h1>
+        <button id="themeToggle" class="btn">Toggle theme</button>
+      </header>
 
-    <main class="container">
-      <section class="card">
-        <h2>Test /process upload</h2>
-        <form id="uploadForm">
-          <input type="file" name="file" accept=".csv,.txt,.json" required />
-          <button class="btn" type="submit">Process</button>
+      <section class="panel">
+        <form action="/process" method="post" enctype="multipart/form-data">
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Original CSV</label>
+              <input type="file" name="base_csv" accept=".csv" required />
+              <div class="hint">We'll use this file's timestamps as the global X-axis.</div>
+            </div>
+
+            <div class="form-group">
+              <label>Title</label>
+              <input type="text" name="title" placeholder="CW Loop" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Additional CSVs (you can select multiple)</label>
+            <input type="file" name="extra_csvs" accept=".csv" multiple />
+            <div class="hint">We'll align to the global timestamps and forward-fill small gaps.</div>
+          </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Tolerance (seconds)</label>
+              <input type="number" name="tolerance" value="5" />
+            </div>
+            <div class="form-group">
+              <label>Y1 Min</label>
+              <input type="number" name="y1min" value="0" />
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Y1 Max</label>
+              <input type="number" name="y1max" value="100" />
+            </div>
+            <div class="form-group">
+              <label>Setpoint Column (optional)</label>
+              <input type="text" name="setpoint" placeholder="e.g., Active CW Flow Setpoint" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Cutoff Datetime (optional)</label>
+            <input type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
+          </div>
+
+          <div class="actions">
+            <button class="btn" type="submit">Process</button>
+            <button class="btn-outline" type="reset">Reset</button>
+            <span class="tip">Tip: Don't open /process directly—use this form so the files post correctly.</span>
+          </div>
         </form>
-        <pre id="result" class="code-block"></pre>
       </section>
-    </main>
 
-    <footer class="container muted">
-      <small>Status: <span id="status">Idle</span></small>
-    </footer>
+      <section class="panel">
+        <h2>Recent Exports</h2>
+        {% if exports_list and exports_list|length %}
+          <div class="exports">
+            {% for x in exports_list %}
+              <div class="export-item">
+                <div class="export-title">{{ x.title }}</div>
+                <div class="export-meta">{{ x.when }}</div>
+                <div class="export-actions">
+                  {% if x.view_url %}<a class="btn-sm" href="{{ x.view_url }}" target="_blank">View</a>{% endif %}
+                  {% if x.csv_url %}<a class="btn-sm" href="{{ x.csv_url }}" target="_blank">CSV</a>{% endif %}
+                  {% if x.zip_url %}<a class="btn-sm" href="{{ x.zip_url }}" target="_blank">ZIP</a>{% endif %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="hint">No exports yet.</div>
+        {% endif %}
+      </section>
+    </div>
 
     <script>
-      // Toggle theme
       document.getElementById('themeToggle').addEventListener('click', () => {
         const root = document.documentElement;
         const isDark = root.classList.toggle('dark');
         try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch(e) {}
-      });
-
-      // Upload handler
-      const form = document.getElementById('uploadForm');
-      const statusEl = document.getElementById('status');
-      const resultEl = document.getElementById('result');
-
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        statusEl.textContent = 'Uploading...';
-        resultEl.textContent = '';
-
-        const fd = new FormData(form);
-        try {
-          const res = await fetch('/process', { method: 'POST', body: fd });
-          const data = await res.json();
-          statusEl.textContent = res.ok ? 'OK' : 'Error';
-          resultEl.textContent = JSON.stringify(data, null, 2);
-        } catch (err) {
-          statusEl.textContent = 'Network error';
-          resultEl.textContent = String(err);
-        }
       });
     </script>
   </body>
