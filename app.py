@@ -149,6 +149,7 @@ def process():
 
         traces = []
         hover_tpl = "<b>%{fullData.name}</b>: %{y}<extra></extra>"
+        has_y2 = False
         for label, orig in clean_to_orig.items():
             arr = merged[orig].astype("float64").where(merged[orig].notna(), None).tolist()
             trace = {
@@ -157,28 +158,37 @@ def process():
                 "mode": "lines",
                 "name": label,
                 "type": "scatter",
-                "hovertemplate": hover_tpl,  # bake in so no JS escaping issues
+                "hovertemplate": hover_tpl,
             }
             if is_y2(label):
                 trace["yaxis"] = "y2"
+                has_y2 = True
             traces.append(trace)
 
-        # Legend at top (horizontal) + room for it, unified hover
+        # layout: top legend, unified hover, extra right margin; y2 axis visible when used
         layout = {
             "hovermode": "x unified",
             "showlegend": True,
             "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-            "margin": {"t": 80},
+            "margin": {"t": 80, "r": 80},
             "xaxis": {"type": "date"},
         }
         if y1min or y1max:
             layout["yaxis"] = {
                 "range": [float(y1min) if y1min else None, float(y1max) if y1max else None]
             }
-        if any(t.get("yaxis") == "y2" for t in traces):
-            layout["yaxis2"] = {"overlaying": "y", "side": "right", "title": ""}
+        if has_y2:
+            layout["yaxis2"] = {
+                "overlaying": "y",
+                "side": "right",
+                "title": "Setpoint",
+                "showline": True,
+                "ticks": "outside",
+                "ticklen": 6,
+                "tickcolor": "#9aa4ad"
+            }
 
-        # Build HTML
+        # HTML
         html = f"""<!doctype html>
 <html>
 <head>
