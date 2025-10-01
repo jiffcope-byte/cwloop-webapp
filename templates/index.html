@@ -1,63 +1,65 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Trend Merge & Viewer</title>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Trend Merge & Viewer</h1>
-    <form class="card grid" method="post" action="/process" enctype="multipart/form-data">
-      <div>
-        <h2>Original CSV</h2>
-        <input class="inp" type="file" name="original" required />
-      </div>
-      <div>
-        <h2>Additional CSVs (you can select multiple)</h2>
-        <input class="inp" type="file" name="additionals" multiple />
-      </div>
-      <div>
-        <h2>Tolerance (seconds)</h2>
-        <input class="inp" type="number" name="tolerance" value="5" min="0" step="1" />
-      </div>
-      <div>
-        <h2>Title</h2>
-        <input class="inp" type="text" name="title" value="CW Loop" />
-      </div>
-      <div>
-        <h2>Y1 Min</h2>
-        <input class="inp" type="number" name="ymin" value="0" />
-      </div>
-      <div>
-        <h2>Y1 Max</h2>
-        <input class="inp" type="number" name="ymax" value="100" />
-      </div>
-      <div>
-        <h2>Setpoint Column (optional)</h2>
-        <input class="inp" type="text" name="setpoint_col" placeholder="e.g., Active CW Flow Setpoint" />
-      </div>
-      <div>
-        <h2>Cutoff Datetime (optional)</h2>
-        <input class="inp" type="text" name="cutoff" placeholder="YYYY-MM-DD HH:MM:SS" />
-      </div>
-      <button type="submit">Process</button>
-    </form>
-    <div>
-      <h2>Recent Exports</h2>
-      {% if exports_list and exports_list|length %}
-        <ul>
-          {% for x in exports_list %}
-            <li>
-              <a href="{{ x.html_url }}" target="_blank">View</a>
-              <a href="{{ x.csv_url }}" target="_blank">CSV</a>
-            </li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <div>No exports yet.</div>
-      {% endif %}
-    </div>
-  </div>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CWLoop Webapp – Dark Mode + /process Fix</title>
+
+    <!-- EARLY THEME: must be first to avoid flash and ensure dark applies -->
+    <script src="/static/darkmode-early.js"></script>
+
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="container">
+      <h1>CWLoop Webapp</h1>
+      <button id="themeToggle" class="btn">Toggle theme</button>
+    </header>
+
+    <main class="container">
+      <section class="card">
+        <h2>Test /process upload</h2>
+        <form id="uploadForm">
+          <input type="file" name="file" accept=".csv,.txt,.json" required />
+          <button class="btn" type="submit">Process</button>
+        </form>
+        <pre id="result" class="code-block"></pre>
+      </section>
+    </main>
+
+    <footer class="container muted">
+      <small>Status: <span id="status">Idle</span></small>
+    </footer>
+
+    <script>
+      // Toggle theme
+      document.getElementById('themeToggle').addEventListener('click', () => {
+        const root = document.documentElement;
+        const isDark = root.classList.toggle('dark');
+        try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch(e) {}
+      });
+
+      // Upload handler
+      const form = document.getElementById('uploadForm');
+      const statusEl = document.getElementById('status');
+      const resultEl = document.getElementById('result');
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        statusEl.textContent = 'Uploading...';
+        resultEl.textContent = '';
+
+        const fd = new FormData(form);
+        try {
+          const res = await fetch('/process', { method: 'POST', body: fd });
+          const data = await res.json();
+          statusEl.textContent = res.ok ? 'OK' : 'Error';
+          resultEl.textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          statusEl.textContent = 'Network error';
+          resultEl.textContent = String(err);
+        }
+      });
+    </script>
+  </body>
 </html>

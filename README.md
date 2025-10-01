@@ -1,15 +1,24 @@
-# Trend Merge & Viewer (Flask)
+CWLoop Complete Example (Fixes Dark Mode + /process 500)
+========================================================
 
-- Upload an **Original CSV** and any number of **Additional CSVs**
-- Aligns additional values to the original timestamps (nearest within tolerance)
-- Outputs a merged CSV + a standalone Plotly HTML viewer (y1=0–100, y2 for setpoint)
+Run locally:
+------------
+python -m venv .venv
+. .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
 
-## Deploy to Render (Free)
+Open http://127.0.0.1:5000/
 
-1. Push this folder to a new GitHub repo.
-2. Go to https://render.com → **New** → **Web Service** → connect your repo.
-3. Render reads `render.yaml` which sets:
-   - Build: `pip install -r requirements.txt`
-   - Start: `gunicorn app:app`
-   - Plan: **Free**
-4. Click **Create Web Service**. After build, your app is live at a public URL.
+Deploy to Render (Python web service):
+--------------------------------------
+- Connect this folder/repo
+- Ensure Build uses requirements.txt
+- Start command comes from Procfile (or set to: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120)
+- Health check path: /healthz
+
+Notes:
+------
+- Dark mode is guaranteed by static/darkmode-early.js, included first in <head>.
+- /process validates uploads, logs exceptions to stderr, and returns JSON 400s for user errors.
+- Replace the pandas preview with your actual processing logic.
