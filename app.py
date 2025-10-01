@@ -23,6 +23,7 @@ def safe_read_csv(file_storage):
         return pd.read_csv(file_storage)
 
 def parse_datetime_index(df):
+    # Prefer explicit Time Stamp column
     if "Time Stamp" in df.columns:
         ts = pd.to_datetime(df["Time Stamp"], errors="coerce")
         df = df.loc[ts.notna()].copy()
@@ -30,6 +31,7 @@ def parse_datetime_index(df):
             ts = ts.dt.tz_localize("UTC")
         df.index = ts[ts.notna()].values
         return df.drop(columns=["Time Stamp"], errors="ignore")
+    # Fallback to first column
     ts = pd.to_datetime(df.iloc[:, 0], errors="coerce")
     df = df.loc[ts.notna()].copy()
     if getattr(ts.dt, "tz", None) is None:
@@ -66,11 +68,22 @@ def ensure_utc_index(df_index):
         idx = pd.to_datetime(df_index, errors="coerce", utc=True)
         return idx
 
+def clean_label(col_name: str) -> str:
+    """
+    1) drop file prefix 'name::'
+    2) keep only the part after the final '.'
+    3) trim whitespace
+    """
+    base = col_name.split("::", 1)[-1]
+    if "." in base:
+        base = base.split(".")[-1]
+    return base.strip()
+
 # ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def index():
     items = []
-    for p in sorted((EXPORT_DIR).glob("*/result.json"), reverse=True):
+    for p in sorted(EXPORT_DIR.glob("*/result.json"), reverse=True):
         try:
             meta = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
@@ -99,6 +112,7 @@ def process():
     title = (request.form.get("title") or "CW Loop").strip()
     y1min = (request.form.get("y1min") or "").strip()
     y1max = (request.form.get("y1max") or "").strip()
+    setpoint_hint = (request.form.get("setpoint") or "").strip().lower()
 
     try:
         base_df = parse_datetime_index(safe_read_csv(base_file))
@@ -117,21 +131,60 @@ def process():
         folder = EXPORT_DIR / stamp
         folder.mkdir(parents=True, exist_ok=True)
 
+        # ---- Build traces with cleaned names / filters --------------------
+        numeric_cols = [c for c in merged.columns if pd.api.types.is_numeric_dtype(merged[c])]
+        traces = []
+        clean_to_orig = {}
+        for c in numeric_cols:
+            label = clean_label(c)
+            # skip "Sequence"
+            if label.lower() == "sequence":
+                continue
+            clean_to_orig[label] = c
+
+        # Save merged.csv (UTC -> naive for file)
         merged_out = merged.copy()
         ts_series = merged_out.index.tz_convert("UTC").tz_localize(None).astype("datetime64[ns]")
         merged_out.insert(0, "Time Stamp", ts_series)
         (folder / "merged.csv").write_text(merged_out.to_csv(index=False), encoding="utf-8")
 
-        numeric_cols = [c for c in merged.columns if pd.api.types.is_numeric_dtype(merged[c])]
         ts_list = merged_out["Time Stamp"].astype(str).tolist()
-        traces = []
-        for c in numeric_cols:
-            arr = merged[c].astype("float64").where(merged[c].notna(), None).tolist()
-            traces.append({"x": ts_list, "y": arr, "mode": "lines", "name": str(c), "type": "scatter"})
-        layout = {"hovermode": "x unified", "xaxis": {"type": "date"}}
+
+        # Decide which series go to y2
+        def is_y2(name: str) -> bool:
+            if setpoint_hint:
+                return name.lower() == setpoint_hint
+            return "setpoint" in name.lower() or "sp" == name.lower()
+
+        for label, orig in clean_to_orig.items():
+            arr = merged[orig].astype("float64").where(merged[orig].notna(), None).tolist()
+            trace = {
+                "x": ts_list,
+                "y": arr,
+                "mode": "lines",
+                "name": label,
+                "type": "scatter",
+            }
+            if is_y2(label):
+                trace["yaxis"] = "y2"
+            traces.append(trace)
+
+        layout = {
+            "hovermode": "x unified",
+            "showlegend": False,              # hide side legend
+            "xaxis": {"type": "date"},
+        }
         if y1min or y1max:
-            rng = [float(y1min) if y1min else None, float(y1max) if y1max else None]
-            layout["yaxis"] = {"range": rng}
+            layout["yaxis"] = {
+                "range": [float(y1min) if y1min else None, float(y1max) if y1max else None]
+            }
+        # y2 axis config (only if any y2 traces exist)
+        if any(t.get("yaxis") == "y2" for t in traces):
+            layout["yaxis2"] = {
+                "overlaying": "y",
+                "side": "right",
+                "title": "",
+            }
 
         html = f"""<!doctype html>
 <html>
@@ -142,10 +195,14 @@ def process():
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 </head>
 <body style="font-family:ui-sans-serif; background:#0b0f14; color:#e6edf3">
-  <h2>{title}</h2>
+  <h2 style="margin:12px 16px;">{title}</h2>
   <div id="chart" style="width:100%;height:80vh"></div>
   <script>
     const data = {json.dumps(traces)};
+    // Hover template for cleaner labels
+    for (const t of data) {{
+      t.hovertemplate = "<b>%{fullData.name}</b>: %{y}<extra></extra>";
+    }}
     const layout = {json.dumps(layout)};
     Plotly.newPlot('chart', data, layout, {{responsive:true}});
   </script>
@@ -161,8 +218,8 @@ def process():
         (folder / "result.json").write_text(json.dumps({
             "title": title,
             "timestamp": stamp,
-            "params": {"tolerance": tol_sec, "y1min": y1min, "y1max": y1max},
-            "columns": numeric_cols
+            "params": {"tolerance": tol_sec, "y1min": y1min, "y1max": y1max, "setpoint": setpoint_hint},
+            "columns": list(clean_to_orig.keys())
         }, indent=2), encoding="utf-8")
 
         return redirect(url_for("index"))
