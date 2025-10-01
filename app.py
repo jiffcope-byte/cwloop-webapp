@@ -11,7 +11,7 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 def safe_read_csv(file_storage):
     try:
         return pd.read_csv(file_storage, encoding="utf-8-sig", sep=None, engine="python")
@@ -23,7 +23,6 @@ def safe_read_csv(file_storage):
         return pd.read_csv(file_storage)
 
 def parse_datetime_index(df):
-    # Prefer explicit Time Stamp column
     if "Time Stamp" in df.columns:
         ts = pd.to_datetime(df["Time Stamp"], errors="coerce")
         df = df.loc[ts.notna()].copy()
@@ -31,7 +30,6 @@ def parse_datetime_index(df):
             ts = ts.dt.tz_localize("UTC")
         df.index = ts[ts.notna()].values
         return df.drop(columns=["Time Stamp"], errors="ignore")
-    # Fallback to first column
     ts = pd.to_datetime(df.iloc[:, 0], errors="coerce")
     df = df.loc[ts.notna()].copy()
     if getattr(ts.dt, "tz", None) is None:
@@ -69,17 +67,13 @@ def ensure_utc_index(df_index):
         return idx
 
 def clean_label(col_name: str) -> str:
-    """
-    1) drop file prefix 'name::'
-    2) keep only the part after the final '.'
-    3) trim whitespace
-    """
+    # 1) drop "file::" prefix  2) keep only after last '.'  3) trim
     base = col_name.split("::", 1)[-1]
     if "." in base:
         base = base.split(".")[-1]
     return base.strip()
 
-# ---------------- Routes ----------------
+# ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def index():
     items = []
@@ -94,8 +88,8 @@ def index():
             "title": meta.get("title", "Export"),
             "when": meta.get("timestamp", ""),
             "view_url": f"{base}/view.html" if (p.parent / "view.html").exists() else None,
-            "csv_url": f"{base}/merged.csv" if (p.parent / "merged.csv").exists() else None,
-            "zip_url": f"{base}/bundle.zip" if (p.parent / "bundle.zip").exists() else None,
+            "csv_url":  f"{base}/merged.csv" if (p.parent / "merged.csv").exists() else None,
+            "zip_url":  f"{base}/bundle.zip" if (p.parent / "bundle.zip").exists() else None,
         })
     return render_template("index.html", exports_list=items)
 
@@ -131,18 +125,16 @@ def process():
         folder = EXPORT_DIR / stamp
         folder.mkdir(parents=True, exist_ok=True)
 
-        # ---- Build traces with cleaned names / filters --------------------
+        # build traces using cleaned labels
         numeric_cols = [c for c in merged.columns if pd.api.types.is_numeric_dtype(merged[c])]
-        traces = []
         clean_to_orig = {}
         for c in numeric_cols:
             label = clean_label(c)
-            # skip "Sequence"
-            if label.lower() == "sequence":
+            if label.lower() == "sequence":  # drop "Sequence"
                 continue
             clean_to_orig[label] = c
 
-        # Save merged.csv (UTC -> naive for file)
+        # write merged.csv (UTC -> naive)
         merged_out = merged.copy()
         ts_series = merged_out.index.tz_convert("UTC").tz_localize(None).astype("datetime64[ns]")
         merged_out.insert(0, "Time Stamp", ts_series)
@@ -150,12 +142,12 @@ def process():
 
         ts_list = merged_out["Time Stamp"].astype(str).tolist()
 
-        # Decide which series go to y2
         def is_y2(name: str) -> bool:
             if setpoint_hint:
                 return name.lower() == setpoint_hint
-            return "setpoint" in name.lower() or "sp" == name.lower()
+            return "setpoint" in name.lower() or name.lower() == "sp"
 
+        traces = []
         for label, orig in clean_to_orig.items():
             arr = merged[orig].astype("float64").where(merged[orig].notna(), None).tolist()
             trace = {
@@ -171,20 +163,18 @@ def process():
 
         layout = {
             "hovermode": "x unified",
-            "showlegend": False,              # hide side legend
+            "showlegend": False,            # hide side legend
             "xaxis": {"type": "date"},
         }
         if y1min or y1max:
             layout["yaxis"] = {
                 "range": [float(y1min) if y1min else None, float(y1max) if y1max else None]
             }
-        # y2 axis config (only if any y2 traces exist)
         if any(t.get("yaxis") == "y2" for t in traces):
-            layout["yaxis2"] = {
-                "overlaying": "y",
-                "side": "right",
-                "title": "",
-            }
+            layout["yaxis2"] = {"overlaying": "y", "side": "right", "title": ""}
+
+        # ESCAPE braces in hovertemplate so f-string doesn't evaluate them
+        hover_tpl = "<b>%{{fullData.name}}</b>: %{{y}}<extra></extra>"
 
         html = f"""<!doctype html>
 <html>
@@ -199,9 +189,8 @@ def process():
   <div id="chart" style="width:100%;height:80vh"></div>
   <script>
     const data = {json.dumps(traces)};
-    // Hover template for cleaner labels
     for (const t of data) {{
-      t.hovertemplate = "<b>%{fullData.name}</b>: %{y}<extra></extra>";
+      t.hovertemplate = {json.dumps(hover_tpl)};
     }}
     const layout = {json.dumps(layout)};
     Plotly.newPlot('chart', data, layout, {{responsive:true}});
