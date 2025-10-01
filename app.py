@@ -67,11 +67,25 @@ def ensure_utc_index(df_index):
         return idx
 
 def clean_label(col_name: str) -> str:
-    # drop "file::" prefix; then keep only after last '.'; trim
+    """drop 'file::' prefix; keep only after last '.'; trim"""
     base = col_name.split("::", 1)[-1]
     if "." in base:
         base = base.split(".")[-1]
     return base.strip()
+
+def is_setpoint_name(name: str, hint: str) -> bool:
+    """Robust Y2 detection on cleaned label."""
+    lname = (name or "").lower().strip()
+    if hint:
+        h = hint.lower().strip()
+        if lname == h or lname.endswith(h):
+            return True
+    # common variants
+    keys = ["setpoint", "set pt", "set-pt", "sp"]
+    if any(k in lname for k in keys):
+        if lname in {"sp"} or lname.endswith(" sp") or "setpoint" in lname or "set pt" in lname or "set-pt" in lname:
+            return True
+    return False
 
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
@@ -106,7 +120,7 @@ def process():
     title = (request.form.get("title") or "CW Loop").strip()
     y1min = (request.form.get("y1min") or "").strip()
     y1max = (request.form.get("y1max") or "").strip()
-    setpoint_hint = (request.form.get("setpoint") or "").strip().lower()
+    setpoint_hint = (request.form.get("setpoint") or "").strip()
 
     try:
         base_df = parse_datetime_index(safe_read_csv(base_file))
@@ -125,7 +139,7 @@ def process():
         folder = EXPORT_DIR / stamp
         folder.mkdir(parents=True, exist_ok=True)
 
-        # Build traces with cleaned names (drop "Sequence")
+        # ---------- Build cleaned series & drop 'Sequence' ----------
         numeric_cols = [c for c in merged.columns if pd.api.types.is_numeric_dtype(merged[c])]
         clean_to_orig = {}
         for c in numeric_cols:
@@ -134,18 +148,26 @@ def process():
                 continue
             clean_to_orig[label] = c
 
-        # Write merged CSV (UTC -> naive for file)
+        # ---------- CSV export with cleaned names (no prefixes), no Sequence ----------
         merged_out = merged.copy()
         ts_series = merged_out.index.tz_convert("UTC").tz_localize(None).astype("datetime64[ns]")
-        merged_out.insert(0, "Time Stamp", ts_series)
-        (folder / "merged.csv").write_text(merged_out.to_csv(index=False), encoding="utf-8")
+        export_df = pd.DataFrame({"Time Stamp": ts_series})
 
-        ts_list = merged_out["Time Stamp"].astype(str).tolist()
+        # Deduplicate cleaned names if needed
+        seen = {}
+        for label, orig in clean_to_orig.items():
+            name = label
+            if name in seen:
+                seen[name] += 1
+                name = f"{name}_{seen[label]}"
+            else:
+                seen[name] = 0
+            export_df[name] = merged_out[orig].values
 
-        def is_y2(name: str) -> bool:
-            if setpoint_hint:
-                return name.lower() == setpoint_hint
-            return "setpoint" in name.lower() or name.lower() == "sp"
+        (folder / "merged.csv").write_text(export_df.to_csv(index=False), encoding="utf-8")
+
+        # ---------- Viewer traces ----------
+        ts_list = export_df["Time Stamp"].astype(str).tolist()
 
         traces = []
         hover_tpl = "<b>%{fullData.name}</b>: %{y}<extra></extra>"
@@ -160,17 +182,17 @@ def process():
                 "type": "scatter",
                 "hovertemplate": hover_tpl,
             }
-            if is_y2(label):
+            if is_setpoint_name(label, setpoint_hint):
                 trace["yaxis"] = "y2"
                 has_y2 = True
             traces.append(trace)
 
-        # layout: top legend, unified hover, extra right margin; y2 axis visible when used
+        # ---------- Layout ----------
         layout = {
             "hovermode": "x unified",
             "showlegend": True,
             "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-            "margin": {"t": 80, "r": 80},
+            "margin": {"t": 80, "r": 90},   # right margin for y2 ticks
             "xaxis": {"type": "date"},
         }
         if y1min or y1max:
@@ -179,16 +201,21 @@ def process():
             }
         if has_y2:
             layout["yaxis2"] = {
+                "visible": True,          # ensure it draws
                 "overlaying": "y",
                 "side": "right",
                 "title": "Setpoint",
                 "showline": True,
                 "ticks": "outside",
                 "ticklen": 6,
-                "tickcolor": "#9aa4ad"
+                "tickcolor": "#9aa4ad",
+                "showgrid": False,
+                "rangemode": "tozero",
+                # independent autorange:
+                "autorange": True
             }
 
-        # HTML
+        # ---------- HTML ----------
         html = f"""<!doctype html>
 <html>
 <head>
@@ -209,6 +236,7 @@ def process():
 </html>"""
         (folder / "view.html").write_text(html, encoding="utf-8")
 
+        # ---------- ZIP bundle ----------
         with zipfile.ZipFile(folder / "bundle.zip", "w", zipfile.ZIP_DEFLATED) as z:
             for p in folder.glob("*"):
                 if p.name != "bundle.zip":
@@ -217,7 +245,10 @@ def process():
         (folder / "result.json").write_text(json.dumps({
             "title": title,
             "timestamp": stamp,
-            "params": {"tolerance": tol_sec, "y1min": y1min, "y1max": y1max, "setpoint": setpoint_hint},
+            "params": {
+                "tolerance": tol_sec, "y1min": y1min, "y1max": y1max,
+                "setpoint_hint": setpoint_hint,
+            },
             "columns": list(clean_to_orig.keys())
         }, indent=2), encoding="utf-8")
 
