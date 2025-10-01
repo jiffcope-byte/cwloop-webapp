@@ -1,3 +1,4 @@
+
 import os, io, zipfile, datetime as dt, json
 from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, jsonify
@@ -17,23 +18,32 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
 def allowed(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED
 
+def safe_read_csv(file_storage):
+    # Robust CSV reader: handles BOM, autodetects delimiter.
+    try:
+        return pd.read_csv(file_storage, encoding='utf-8-sig', sep=None, engine='python')
+    except Exception:
+        file_storage.seek(0)
+        return pd.read_csv(file_storage)
+
 def parse_datetime_index(df):
-    # prefer common timestamp headers
-    for c in df.columns:
-        lc = str(c).lower().strip()
-        if lc in ('time stamp', 'timestamp', 'time', 'datetime', 'date time'):
-            ts = pd.to_datetime(df[c], errors='coerce', utc=True)
-            df = df.loc[ts.notna()].copy()
-            df.index = ts[ts.notna()].values
-            return df.drop(columns=[c], errors='ignore')
+    # Prefer 'Time Stamp' column; localize tz-naive to UTC.
+    if "Time Stamp" in df.columns:
+        ts = pd.to_datetime(df["Time Stamp"], errors="coerce")
+        df = df.loc[ts.notna()].copy()
+        if ts.dt.tz is None:
+            ts = ts.dt.tz_localize("UTC")
+        df.index = ts[ts.notna()].values
+        return df.drop(columns=["Time Stamp"], errors="ignore")
     # fallback: first column
-    c0 = df.columns[0]
-    ts = pd.to_datetime(df[c0], errors='coerce', utc=True)
+    ts = pd.to_datetime(df.iloc[:, 0], errors="coerce")
     if ts.notna().any():
         df = df.loc[ts.notna()].copy()
+        if ts.dt.tz is None:
+            ts = ts.dt.tz_localize("UTC")
         df.index = ts[ts.notna()].values
-        return df.drop(columns=[c0], errors='ignore')
-    raise ValueError('No datetime-like column found')
+        return df.drop(df.columns[0], axis=1)
+    raise ValueError("No usable timestamp column found")
 
 def merge_with_asof(base, others, tol_sec):
     base = base.sort_index()
@@ -64,8 +74,11 @@ def too_large(e):
 @app.errorhandler(Exception)
 def handle_any_error(e):
     import sys, traceback
-    traceback.print_exc(file=sys.stderr)  # visible in Render logs
-    return render_template('error.html', message='Server error while processing. Check logs for details.'), 500
+    traceback.print_exc(file=sys.stderr)
+    try:
+        return render_template('error.html', message='Server error while processing. Check logs for details.'), 500
+    except Exception:
+        return jsonify(error='Server error while processing. Check logs for details.'), 500
 
 # ---------- UI ----------
 def list_exports():
@@ -95,7 +108,6 @@ def process():
     if request.method == 'GET':
         return redirect(url_for('index'))
 
-    # validate inputs
     if 'base_csv' not in request.files:
         return render_template('error.html', message="Missing 'Original CSV'."), 400
     base_file = request.files['base_csv']
@@ -121,14 +133,14 @@ def process():
         folder = EXPORT_DIR / stamp
         folder.mkdir(parents=True, exist_ok=True)
 
-        base_df = pd.read_csv(base_file)
+        base_df = safe_read_csv(base_file)
         base_df = parse_datetime_index(base_df)
 
         others_list = []
         for f in others_files:
             if not f or not f.filename:
                 continue
-            odf = pd.read_csv(f)
+            odf = safe_read_csv(f)
             odf = parse_datetime_index(odf)
             stem = Path(f.filename).stem
             others_list.append((stem, odf))
@@ -143,26 +155,19 @@ def process():
                 pass
 
         merged_out = merged.copy()
-        merged_out.insert(0, 'Time Stamp', merged_out.index.tz_convert(None).astype('datetime64[ns]'))
+        merged_out.insert(
+            0, 'Time Stamp',
+            merged_out.index.tz_convert('UTC').tz_localize(None).astype('datetime64[ns]')
+        )
         (folder / 'merged.csv').write_text(merged_out.to_csv(index=False), encoding='utf-8')
 
-        # Build Plotly HTML without tricky f-strings
         cols = [c for c in merged.columns if merged[c].dtype != 'O']
         ts_list = merged_out['Time Stamp'].astype(str).tolist()
 
-        # Build JS arrays by json
-        X_json = json.dumps(ts_list)
         traces = []
         for c in cols:
             arr = merged[c].astype('float64').where(merged[c].notna(), None).tolist()
-            traces.append({
-                'x': ts_list,
-                'y': arr,
-                'mode': 'lines',
-                'name': str(c),
-                'type': 'scatter'
-            })
-        traces_json = json.dumps(traces)
+            traces.append({'x': ts_list, 'y': arr, 'mode': 'lines', 'name': str(c), 'type': 'scatter'})
 
         yaxis = {}
         if y1min:
@@ -173,12 +178,7 @@ def process():
             else:
                 yaxis['range'] = [None, float(y1max)]
 
-        layout = {
-            'hovermode': 'x unified',
-            'xaxis': {'type': 'date'},
-            'yaxis': yaxis
-        }
-        layout_json = json.dumps(layout)
+        layout = {'hovermode': 'x unified', 'xaxis': {'type': 'date'}, 'yaxis': yaxis}
 
         html = []
         html.append("<!doctype html><html><head><meta charset='utf-8'>")
@@ -188,13 +188,13 @@ def process():
         html.append("</head><body style='font-family:ui-sans-serif; background:#0b0f14; color:#e6edf3'>")
         html.append("<h2>" + title + "</h2>")
         html.append("<div id='chart' style='width:100%;height:80vh'></div>")
-        html.append("<script>")
-        html.append("const data = " + traces_json + ";")
-        html.append("const layout = " + layout_json + ";")
-        html.append("Plotly.newPlot('chart', data, layout, {responsive:true});")
-        html.append("</script></body></html>")
+        html.append("<script>const data = " + json.dumps(traces) + ";")
+        html.append("const layout = " + json.dumps(layout) + ";")
+        html.append("Plotly.newPlot('chart', data, layout, {responsive:true});</script>")
+        html.append("</body></html>")
 
-        (folder / 'view.html').write_text("\n".join(html), encoding='utf-8')
+        (folder / 'view.html').write_text("
+".join(html), encoding='utf-8')
 
         with zipfile.ZipFile(folder / 'bundle.zip', 'w', zipfile.ZIP_DEFLATED) as z:
             for p in folder.glob('*'):
@@ -213,7 +213,10 @@ def process():
     except Exception:
         import sys, traceback
         traceback.print_exc(file=sys.stderr)
-        return render_template('error.html', message='Processing failed. See server logs for details.'), 400
+        try:
+            return render_template('error.html', message='Processing failed. See server logs for details.'), 400
+        except Exception:
+            return jsonify(error='Processing failed. See server logs for details.'), 400
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
